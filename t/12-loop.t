@@ -1,0 +1,153 @@
+#!perl
+use strict;
+use warnings;
+use Test::More;
+use Time::HiRes ();
+use POSIX ();
+use Hyperman::Loop;
+use Hyperman::Future;
+
+# Hard watchdog. This file finishes in well under a second; a stalled
+# readiness/timer path (as happened once on a FreeBSD smoker) must fail fast,
+# not hang for hours. A Perl alarm cannot interrupt a blocked C event loop, so
+# fork a killer that SIGKILLs us if we overrun. The child uses _exit so it
+# never runs END/Test::More teardown, and kills only its live parent (once the
+# parent exits it is reparented to init, so a stale pid is never signalled).
+my $watchdog = fork;
+if (defined $watchdog && $watchdog == 0) {
+    $SIG{TERM} = sub { POSIX::_exit(0) };
+    sleep 30;
+    kill 'KILL', getppid();
+    POSIX::_exit(0);
+}
+END { kill 'TERM', $watchdog if $watchdog }
+
+my $loop = Hyperman::Loop->new;
+isa_ok($loop, 'Hyperman::Loop');
+ok(length $loop->backend, 'backend selected: ' . $loop->backend);
+
+# Backend selection by name. Exactly one readiness floor exists per
+# platform - poll(2) on Unix, WSAPoll on Windows - and asking for the
+# other one declines rather than quietly handing back something else.
+{
+    my $floor = $^O eq 'MSWin32' ? 'wsapoll' : 'poll';
+    my $other = $^O eq 'MSWin32' ? 'poll'    : 'wsapoll';
+    my $named = Hyperman::Loop->new($floor);
+    is($named->backend, $floor, "backend '$floor' selectable by name");
+    ok(!eval { Hyperman::Loop->new($other); 1 },
+       "backend '$other' declines on this platform");
+    ok(!eval { Hyperman::Loop->new('nosuchbackend'); 1 },
+       'an unknown backend name croaks');
+}
+
+# ---- one-shot callback timer ---------------------------------------------
+{
+    my $fired = 0;
+    $loop->timer(0.02, sub { $fired++; $loop->stop });
+    my $t0 = Time::HiRes::time();
+    $loop->run;
+    my $dt = Time::HiRes::time() - $t0;
+    is($fired, 1, 'timer callback fired once');
+    cmp_ok($dt, '>=', 0.015, 'after the delay');
+    cmp_ok($dt, '<', 1, 'without hanging');
+}
+
+# ---- timer_f + run_until -------------------------------------------------
+{
+    my $f = $loop->timer_f(0.02);
+    ok(!$f->is_ready, 'timer future pending');
+    $loop->run_until($f);
+    ok($f->is_done, 'timer future resolved by run_until');
+}
+
+# ---- deferred queue ------------------------------------------------------
+{
+    my @order;
+    $loop->defer(sub { push @order, 'a' });
+    $loop->defer(sub { push @order, 'b'; $loop->defer(sub { push @order, 'c' }) });
+    my $f = $loop->timer_f(0.02);
+    $loop->run_until($f);
+    is_deeply(\@order, [qw(a b c)], 'deferred callbacks run FIFO, re-defers included');
+}
+
+# ---- io watchers on a pipe -----------------------------------------------
+{
+    pipe(my $r, my $w) or die "pipe: $!";
+    my $f = $loop->readable_f($r);
+    ok(!$f->is_ready, 'readable_f pending on empty pipe');
+    $loop->timer(0.01, sub { syswrite $w, "x" });
+    $loop->run_until($f);
+    ok($f->is_done, 'readable future resolved when pipe had data');
+    sysread $r, my $buf, 1;
+
+    my $wf = $loop->writable_f($w);
+    $loop->run_until($wf);
+    ok($wf->is_done, 'writable future resolves on writable pipe');
+}
+
+# ---- a watch replacing a pending readiness future cancels it -------------
+{
+    pipe(my $r, my $w) or die "pipe: $!";
+    my $f = $loop->readable_f($r);
+    my $watcher = $loop->watch_io($r, 'r', sub { $loop->stop });
+    ok($f->is_cancelled, 'readable_f replaced by watch_io on the same fd is cancelled, not dropped');
+    my $err = do { local $@; eval { $f->get }; $@ };
+    like($err, qr/cancel/i, '...so a ->get on it dies instead of pumping the loop for ever');
+    $loop->unwatch_io($watcher);
+}
+
+# ---- persistent watch_io + unwatch_io ------------------------------------
+{
+    pipe(my $r, my $w) or die "pipe: $!";
+    my $hits = 0;
+    # Read one byte per fire, not the whole buffer: if both timers fire before
+    # the loop services the pipe (likely on a slow/loaded box) the two writes
+    # coalesce, and a level-triggered watcher that drained everything at once
+    # would fire only once - hanging this test waiting for a second hit. One
+    # byte at a time lets the still-readable pipe re-fire the watcher.
+    my $watcher = $loop->watch_io($r, 'r', sub {
+        $hits++;
+        sysread $r, my $buf, 1;
+        $loop->stop if $hits >= 2;
+    });
+    $loop->timer(0.01, sub { syswrite $w, "1" });
+    $loop->timer(0.03, sub { syswrite $w, "2" });
+    $loop->run;
+    is($hits, 2, 'persistent watcher fired per readiness');
+    $loop->unwatch_io($watcher);
+    ok(1, 'unwatch_io removed the watcher');
+}
+
+# ---- install_await: ->get pumps this loop --------------------------------
+{
+    $loop->install_await;
+    my $f = $loop->timer_f(0.02)->then(sub { 'pumped' });
+    is(scalar($f->get), 'pumped', 'get on a pending future pumps the loop');
+}
+
+# ---- a timer never fires before its deadline -----------------------------
+# The kernel's timer is not the deadline. NetBSD's kqueue schedules
+# EVFILT_TIMER in scheduler ticks and, in a VM, delivered a 300ms timer at
+# 246ms; the loop re-arms an early oneshot for the remainder of its own
+# deadline, measured on the same monotonic clock as here. Every backend this
+# build has gets the same pin; within a millisecond is the backends' rounding.
+{
+    my $now = eval {
+        my $clk = Time::HiRes::CLOCK_MONOTONIC();
+        Time::HiRes::clock_gettime($clk);
+        sub { Time::HiRes::clock_gettime($clk) };
+    } || \&Time::HiRes::time;
+    for my $name (qw(kqueue epoll io_uring poll)) {
+      SKIP: {
+            my $l = eval { Hyperman::Loop->new($name) };
+            skip "no $name backend in this build", 1 unless $l;
+            my $t0 = $now->();
+            my $f  = $l->timer_f(0.05);
+            $l->run_until($f);
+            cmp_ok($now->() - $t0, '>=', 0.05 - 1e-3,
+                   "$name: a 50ms timer did not fire early");
+        }
+    }
+}
+
+done_testing;

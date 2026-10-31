@@ -1,0 +1,271 @@
+#!perl
+use strict;
+use warnings;
+use Test::More;
+use Hyperman;
+use Hyperman::Future;
+
+# The protocol methods are always present; the async sub syntax that uses
+# them is not, so the file is split in two. Everything that can be tested
+# by calling the methods directly runs everywhere.
+
+sub F { Hyperman::Future->new }
+
+# ---- the protocol is complete --------------------------------------------
+for my $m (qw(
+    AWAIT_NEW_DONE AWAIT_NEW_FAIL AWAIT_CLONE
+    AWAIT_DONE AWAIT_FAIL AWAIT_GET AWAIT_WAIT
+    AWAIT_IS_READY AWAIT_IS_CANCELLED
+    AWAIT_ON_READY AWAIT_ON_CANCEL AWAIT_CHAIN_CANCEL
+)) {
+    ok(Hyperman::Future->can($m), "$m is implemented");
+}
+
+# ---- constructors --------------------------------------------------------
+{
+    my $f = Hyperman::Future->AWAIT_NEW_DONE('result');
+    isa_ok($f, 'Hyperman::Future', 'AWAIT_NEW_DONE');
+    ok($f->AWAIT_IS_READY, 'AWAIT_NEW_DONE is ready');
+    ok(!$f->AWAIT_IS_CANCELLED, 'AWAIT_NEW_DONE is not cancelled');
+    is_deeply([$f->AWAIT_GET], ['result'], 'AWAIT_GET in list context');
+    is(scalar $f->AWAIT_GET, 'result', 'AWAIT_GET in scalar context');
+}
+{
+    my $f = Hyperman::Future->AWAIT_NEW_FAIL('Oopsie');
+    ok($f->AWAIT_IS_READY, 'AWAIT_NEW_FAIL is ready');
+    my $line = __LINE__ + 1;
+    ok(!eval { $f->AWAIT_GET; 1 }, 'AWAIT_GET on a failure dies');
+    is($@, "Oopsie at " . __FILE__ . " line $line.\n",
+       'the exception is reported at the caller');
+}
+{
+    # A blessed failure must arrive blessed, not stringified.
+    my $err = bless {}, 'Hyperman::Test::Err';
+    my $f = Hyperman::Future->AWAIT_NEW_FAIL($err);
+    ok(!eval { $f->AWAIT_GET; 1 }, 'AWAIT_GET on a blessed failure dies');
+    is(ref($@), 'Hyperman::Test::Err', 'the blessed exception is not flattened');
+}
+
+# ---- the croak_sv compat shim -------------------------------------------
+# hm_compat.h's croak_sv shim stands in only on perls before 5.14, so on a
+# perl anyone develops on, nothing else here reaches it. It is compiled
+# unconditionally and driven through _croak_sv_selftest so that its code
+# runs somewhere a failure is visible before a smoker finds it.
+#
+# BE CLEAR ABOUT WHAT THIS CANNOT DO. It cannot catch the bug it was
+# written after: 0.41's shim raised the message through croak(NULL), which
+# on old perls takes ERRSV verbatim and dropped the " at FILE line N.",
+# but on a modern perl routes through mess_sv and appends it like croak_sv
+# does. Both shims pass every assertion below on 5.42 - measured, by
+# building the old one and running this file. The version-dependent half
+# is only ever provable on a smoker; what is checked here is the half that
+# holds on every perl - the shapes it must handle and the blessed error it
+# must not flatten.
+{
+    my @cases = (
+        ['a plain string',       'Oopsie',    "Oopsie\@LINE"     ],
+        ['a trailing newline',   "Oopsie\n",  "Oopsie\n"         ],
+        ['an empty string',      '',          "\@LINE"           ],
+    );
+    for my $c (@cases) {
+        my ($name, $in, $want) = @$c;
+        my $line = __LINE__ + 1;
+        ok(!eval { Hyperman->_croak_sv_selftest($in); 1 }, "the shim raises $name");
+        (my $expect = $want) =~ s/\@LINE/ at ${\ __FILE__ } line $line.\n/;
+        is($@, $expect, "the shim reports $name like croak_sv");
+    }
+    my $err = bless {}, 'Hyperman::Test::Err';
+    ok(!eval { Hyperman->_croak_sv_selftest($err); 1 }, 'the shim raises a blessed error');
+    is(ref($@), 'Hyperman::Test::Err', 'the shim keeps a blessed error blessed');
+}
+
+# ---- clone ---------------------------------------------------------------
+{
+    my $f = F();
+    my $g = $f->AWAIT_CLONE;
+    isa_ok($g, 'Hyperman::Future', 'AWAIT_CLONE');
+    ok(!$g->AWAIT_IS_READY, 'the clone is pending');
+    ok(!$f->AWAIT_IS_READY, 'the original is untouched');
+    isnt("$f", "$g", 'the clone is a different future');
+}
+
+# ---- AWAIT_GET reads, AWAIT_WAIT waits -----------------------------------
+{
+    # Outside a loop, waiting on a pending future is an error. AWAIT_GET must
+    # not wait, so it reports unreadiness rather than the loop's complaint.
+    my $f = F();
+    ok(!eval { $f->AWAIT_GET; 1 }, 'AWAIT_GET on a pending future dies');
+    like($@, qr/not ready/, 'AWAIT_GET did not try to run a loop');
+    ok(!eval { $f->AWAIT_WAIT; 1 }, 'AWAIT_WAIT on a pending future dies');
+    like($@, qr/without an event loop/, 'AWAIT_WAIT tried to wait');
+}
+
+# ---- settling ------------------------------------------------------------
+{
+    my $f = F();
+    $f->AWAIT_DONE('a', 'b');
+    is_deeply([$f->AWAIT_GET], ['a','b'], 'AWAIT_DONE sets the result');
+}
+{
+    my $f = F();
+    $f->AWAIT_FAIL("late\n");
+    ok(!eval { $f->AWAIT_GET; 1 }, 'AWAIT_FAIL sets the failure');
+    is($@, "late\n", 'the failure message is preserved verbatim');
+}
+
+# ---- on_ready ------------------------------------------------------------
+{
+    my $f = F();
+    my $fired = 0;
+    $f->AWAIT_ON_READY(sub { $fired++ });
+    is($fired, 0, 'AWAIT_ON_READY has not fired yet');
+    $f->done;
+    is($fired, 1, 'AWAIT_ON_READY fired on completion');
+}
+
+# ---- on_cancel: code references ------------------------------------------
+{
+    my $f = F();
+    my $fired = 0;
+    $f->on_cancel(sub { $fired++ });
+    is($fired, 0, 'on_cancel has not fired yet');
+    $f->cancel;
+    is($fired, 1, 'on_cancel fired on cancellation');
+}
+{
+    my $f = F();
+    my $fired = 0;
+    $f->on_cancel(sub { $fired++ });
+    $f->done;
+    is($fired, 0, 'on_cancel does not fire on a normal completion');
+}
+{
+    my $f = F();
+    $f->cancel;
+    my $fired = 0;
+    $f->on_cancel(sub { $fired++ });
+    is($fired, 1, 'on_cancel on an already-cancelled future fires at once');
+}
+{
+    my $f = F()->done;
+    my $fired = 0;
+    $f->on_cancel(sub { $fired++ });
+    is($fired, 0, 'on_cancel on a completed future is dropped');
+}
+{
+    my $f = F();
+    my @order;
+    $f->on_cancel(sub { push @order, 1 });
+    $f->on_cancel(sub { push @order, 2 });
+    $f->cancel;
+    is_deeply(\@order, [1,2], 'on_cancel callbacks run in registration order');
+}
+
+# ---- chain cancel: futures -----------------------------------------------
+{
+    my ($f1, $f2) = (F(), F());
+    $f1->AWAIT_CHAIN_CANCEL($f2);
+    ok(!$f2->is_cancelled, 'the chained future is not cancelled yet');
+    $f1->cancel;
+    ok($f2->is_cancelled, 'cancelling f1 cancels f2');
+}
+{
+    my ($f1, $f2) = (F(), F());
+    $f1->AWAIT_CHAIN_CANCEL($f2);
+    $f2->cancel;
+    ok(!$f1->is_cancelled, 'there is no link back from f2 to f1');
+}
+{
+    my ($f1, $f2) = (F(), F());
+    $f1->AWAIT_CHAIN_CANCEL($f2);
+    $f1->done;
+    ok(!$f2->is_cancelled, 'completing f1 leaves f2 alone');
+}
+
+# ---- async sub integration -----------------------------------------------
+SKIP: {
+    skip 'Future::AsyncAwait required for the async sub tests', 9
+        unless eval { require Future::AsyncAwait; 1 };
+
+    # Which version, in the output, because a smoker report does not say.
+    # Future::AsyncAwait is not a prerequisite of this distribution - the
+    # tests use it if it is there - so it never appears in a report's
+    # PREREQUISITES table, and a failure that depends on its version has
+    # nothing in the report to pin it to.
+    diag("Future::AsyncAwait $Future::AsyncAwait::VERSION");
+
+    # Cancellation across an await is the one thing here that Future::
+    # AsyncAwait drives rather than this class, and BEFORE PERL 5.24 IT DOES
+    # NOT DRIVE IT.
+    #
+    # Measured, not inferred, with a logging Awaitable class that records
+    # every call it receives (same F::AA 0.71 throughout):
+    #
+    #   perl 5.24+  inner.ON_READY, inner.CLONE->outer,
+    #               outer.CHAIN_CANCEL(inner)   -> cancel reaches inner
+    #   perl 5.22   inner.ON_READY, inner.CLONE->outer,
+    #               outer.ON_CANCEL(CODE)       -> the code runs on cancel
+    #                                              and does not touch inner
+    #
+    # So on an older perl F::AA never says which future to chain, and no
+    # implementation of this protocol can pass the assertion - a pure-Perl
+    # class fails it identically. This class implements both spellings and
+    # t/39 proves the whole API against F::AA's own conformance suite.
+    #
+    # The gate is the PERL version, not the F::AA version: Punk 0.41 FAILed
+    # the same assertion on a 5.18.0 smoker carrying F::AA 0.66, which is
+    # well past every rename in F::AA's own changelog.
+    my $chains = $] >= 5.024;
+
+    # async sub is syntax, so the whole block has to be compiled late.
+    my $ok = eval <<'ASYNC';
+        use Future::AsyncAwait future_class => 'Hyperman::Future';
+
+        {   # a future of this class can be awaited, and the async sub
+            # returns one of the same class
+            my $inner = Hyperman::Future->new;
+            async sub t_await { my $v = await $inner; return "got:$v" }
+            my $outer = t_await();
+            isa_ok($outer, 'Hyperman::Future', 'the async sub result');
+            ok(!$outer->is_ready, 'the async sub is suspended on the await');
+            $inner->done(42);
+            ok($outer->is_ready, 'resolving the awaited future resumes it');
+            is(scalar $outer->get, 'got:42', 'the awaited value reached the body');
+        }
+
+        {   # a failure crosses the await
+            my $inner = Hyperman::Future->new;
+            async sub t_fail { await $inner; return 1 }
+            my $outer = t_fail();
+            $inner->fail("kaboom\n");
+            ok($outer->is_failed, 'the async sub failed');
+            is($outer->failure, "kaboom\n", 'the failure crossed the await');
+        }
+
+        {   # cancelling the outer future cancels what it is awaiting
+            SKIP: {
+                skip 'Future::AsyncAwait chains cancellation into the '
+                   . 'awaited future only on perl 5.24+', 1 unless $chains;
+                my $inner = Hyperman::Future->new;
+                async sub t_cancel { await $inner; return 1 }
+                my $outer = t_cancel();
+                $outer->cancel;
+                ok($inner->is_cancelled,
+                    'cancelling the caller cancels the awaited future');
+            }
+        }
+
+        {   # the shape a PAGI application produces: two sequential sends,
+            # each resolving immediately
+            my $send = sub { my $f = Hyperman::Future->new; $f->done; $f };
+            async sub t_pagi { my $s = shift; await $s->(); await $s->(); return }
+            my $outer = t_pagi($send);
+            ok($outer->is_ready, 'two sequential awaits complete');
+            ok(!$outer->is_failed, 'two sequential awaits did not fail');
+        }
+        1;
+ASYNC
+    diag("async sub block failed to compile: $@") unless $ok;
+}
+
+done_testing;

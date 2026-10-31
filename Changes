@@ -1,0 +1,706 @@
+Revision history for Hyperman
+
+0.65	2026-10-31
+        - FIX: a ->get from an event's callback never saw the events
+          taken in the same batch, so it waited on a timer or a stop that
+          was already due (t/63 hung on FreeBSD smokers).
+        - FIX: a die out of a nested ->get left the loop's run depth and
+          current loop behind.
+        - FIX: the Windows build did not compile: the re-exec argv and
+          geteuid are POSIX only, and an older mingw hides WSAPoll,
+          AI_NUMERICSERV, inet_ntop, inet_pton and uint64_t.
+
+0.64	2026-10-21
+        - FIX: DATA sent in the same read as an Extended CONNECT's headers
+          was buffered as psgi.input and never reached the stream handle's
+          read half, so a WebSocket's first message over HTTP/2 was lost
+        - FIX: on io_uring with completion reads, the request after one
+          pipelined behind a streamed body was never read: the read armed
+          before the buffer was compacted landed at the old offset (t/27 on
+          every Linux smoker with liburing).
+
+0.63	2026-10-16
+        - FIX: a build without nghttp2 or without OpenSSL did not compile:
+          the HTTP/2 writer stub returned nothing and the QUIC context
+          builder had no stub.
+
+0.62	2026-10-16
+        - SECURITY: FIX a Future's get and failure pushing results through a
+          stack pointer the nested loop had moved (heap corruption).
+        - SECURITY: FIX a completion read landing under a running handler
+          re-parsing its request and underflowing the buffer (io_uring).
+        - SECURITY: FIX bytes arriving while a synchronous 101 handler waited
+          being handed to the tunnel before the request was consumed.
+        - SECURITY: FIX a timer cancelled from an earlier event in the same
+          batch being freed before its own event was dispatched.
+        - SECURITY: FIX an HTTP/3 handler that waited freeing its own
+          connection: requests are dispatched after ngtcp2 returns, and a
+          connection with a handler on the stack is freed when it returns.
+        - SECURITY: FIX a partial PROXY header spinning the worker at 100% CPU.
+        - SECURITY: a bare LF or CR in a chunk extension or a trailer is a 400.
+        - SECURITY: a numeric user with no passwd entry needs a group.
+        - SECURITY: the pid file's temporary is created exclusively, never
+          through a symlink, with a random name.
+        - SECURITY: accepted sockets, log handles and adopted listeners are
+          close-on-exec; accept4(2) where the platform has it.
+        - SECURITY: the QUIC per-source table is keyed and closes its probe
+          chain on delete, so a freed slot no longer hides or duplicates
+          its neighbours; a refused count is never decremented.
+        - SECURITY: nghttp2's rapid-reset and CONTINUATION limits are set
+          explicitly where the library offers them.
+        - SECURITY: a Future method on something that is not a future
+          croaks instead of crashing.
+
+0.61	2026-10-15
+        - FIX: on io_uring with completion reads, an HTTP/2 handler that
+          waited for its body to drain never read its connection, so the
+          window updates it waited on arrived only after it gave up
+          (t/41 on every Linux smoker with liburing).
+
+0.60	2026-10-14
+        - FIX: a stream handle's write was never answered "full" over
+          HTTP/2, so a producer never paused and the whole body was held.
+        - FIX: an HTTP/2 handler that waited for its body to drain waited
+          for nothing: requests are now handed to the application after
+          nghttp2's receive call returns, not from inside it.
+        - TEST: t/53 failed on OpenBSD; a pipe there has no inode, so the
+          test helper took the arena's wakeup pipes for the harness's.
+
+0.59	2026-10-13
+        - FIX: an HTTP/2 stream-handle body was cut at the first DATA frame
+          sent after the close.
+
+0.58	2026-10-12
+        - FIXES t/59-ipv6.t on a resolver that answers nonexistent.invalid.
+        - t/50-scoreboard.t says why when the attach by name fails.
+
+0.57	2026-10-11
+        - Streamed HTTP/1.1 responses are chunked and keep the connection.
+        - access_log_format: Apache directives or json, compiled once.
+        - error_log: the server's own messages, stamped, to a file or handle.
+        - psgix.request_start when the log format measures durations.
+        - user, group, umask, pid_file: drop privileges after the bind.
+        - IPv6 listeners and hostnames; an unresolvable host is refused.
+        - Unix-domain listeners (path, mode) and LISTEN_FDS socket activation.
+        - proxy_protocol: v1 and v2 headers read before TLS, per listener.
+        - A request line must be METHOD target HTTP/d.d; anything else is 400.
+        - USR2 re-execs the supervisor: a fresh compile adopts the sockets and
+          the named arena, then the old pool drains. HUP is unchanged.
+        - Listener sockets are close-on-exec.
+        - body_timeout: a body is timed by progress, apart from the headers.
+        - QUIC caps half-open handshakes per source address at 32.
+        - Combinators cancel their losers and their inputs when cancelled.
+        - A watch replacing a pending readable_f/writable_f cancels it.
+        - A closed psgi.input no longer breaks later bodyless requests.
+        - FIX: an h2c preface sent in one burst with an oversize body got a
+          plain-text 413 and a close instead of an h2 413 (FreeBSD smokers).
+        - FIX: an h2 413 for an oversize body now ends the stream with
+          RST_STREAM NO_ERROR (curl on FreeBSD saw no status at all).
+
+0.56	2026-10-11
+        - SECURITY: max_body bounds HTTP/2 and HTTP/3 bodies too.
+        - SECURITY: request header blocks are bounded at 64KB on h2 and h3.
+        - SECURITY: FIX a use-after-free when an h2 response closed the
+          connection from inside an nghttp2 callback.
+        - SECURITY: FIX a connection closed under a synchronous handler
+          that awaits being pooled and reused while the handler ran.
+        - SECURITY: REMOTE_ADDR, SERVER_NAME and psgi.errors are
+          per-request copies, not the connection's shared values.
+        - SECURITY: request headers with an underscore in the name are dropped.
+        - SECURITY: whitespace before a header colon, a bare LF or CR, an
+          empty request line and a chunk-size line over 16 digits are 400.
+        - SECURITY: a response header carrying CR, LF or NUL is a 500.
+        - SECURITY: queued responses per connection are capped at 1MB on
+          HTTP/1.1 pipelines and h2 sessions.
+        - SECURITY: RST_STREAM cancels the stream's parked Future.
+        - SECURITY: :scheme and :authority no longer set psgi.url_scheme
+          or SERVER_NAME; a Host beside :authority is ignored.
+        - SECURITY: http3_max_conns defaults to 1024.
+        - HTTP/2 over TLS reports HTTPS and SSL_* as HTTP/1.1 does.
+        - HEAD is answered without a body.
+        - Every response carries a Date header.
+        - Compression skips a response that sets a cookie.
+        - EMFILE at accept no longer spins the worker.
+        - Perl callbacks from the loop are trapped and reported.
+        - FIX a cancelled derived Future being settled by its continuation.
+        - FIX a second Hyperman::Loop wrapper freeing a Perl-owned loop.
+        - FIX an HTTP/1 Writer dropped without close leaking its connection.
+        - FIX an h2 upload over 16KB closing the connection under a small max_body.
+        - FIX the h3 responder writing from inside an ngtcp2 callback.
+        - A pooled connection frees buffers grown past 16KB / 1MB.
+        - A chunked body is scanned from its last validated chunk per read.
+        - REMOTE_USER is escaped in the access log.
+        - t/56 and t/57 cover the above.
+
+0.55	2026-10-05
+        - A oneshot timer the backend delivers before its deadline is
+          re-armed for the remainder instead of fired
+        - kqueue arms timers in whole milliseconds rounded up, not down.
+        - t/12 pins a 50ms timer against the monotonic clock on every
+          backend the build has.
+
+0.54	2026-09-24
+        - FIX: a resolved Future and its callbacks were held for the life of
+          the process.
+        - t/55 counts callbacks released while the loop is still running.
+
+0.53	2026-09-24
+        - FIX: max_requests_per_worker was only tested on the HTTP/1 path, so
+          a worker serving HTTP/2 or HTTP/3 counted its requests and never
+          retired. A pool whose clients are browsers never recycled at all.
+        - t/54 covers the recycle over HTTP/1.1, HTTP/2 and HTTP/3.
+
+0.52	2026-09-22
+        - FIX: an alarm() already pending when run() is called is carried, not
+          cancelled.
+        - The USR1 dump is written in one piece. Read while it was being
+          written, its three writes could show an aggregate line with no worker
+          rows under it.
+        - t/51 no longer assumes the worker holding the lease is one of the
+          workers that answered
+        - t/50 polls for the whole USR1 dump rather than its first line.
+
+0.51	2026-09-20
+        - FIXES a respawned worker going deaf to the bus for the rest of its
+          life. 
+        - A worker with no waker claims any free one rather than going silent,
+          and says so when there is none. Single-worker mode held none at all.
+        - Wakers are sized for two generations: a HUP forks the new pool while
+          the old drains, and the fresh workers found every slot held.
+        - Requires Shared::Arena 0.12, which reclaims a dead owner's slot.
+
+0.50	2026-09-19
+        - Now Depends on Shared::Arena: one arena is created before the fork and
+          Hyperman->arena hands it to Perl; run(arena_name => ..., arena_size => ...).
+        - The denylist and the fixed-window rate counters live on two maps in
+          that arena; the accept path no longer reads the clock. hm_ratelimit.h is gone.
+        - The message bus is a Shared::Arena ring in the same arena, with the
+          same doors, ceiling and delivery modes. hm_bus.h stays published for
+          Punk::Observe only.
+        - A worker scoreboard mirrored once a second: Hyperman->pool_stats,
+          stats(pool => 1), USR1 prints the aggregate, a wedged worker is logged.
+        - Hyperman->leader, Hyperman->distinct_clients (run(distinct_clients => 1)).
+        - C ABI 9: arena_region, arena_table, pool_stats.
+        - FIX: a respawned worker inherited the supervisor's signal handlers and
+          blocked mask, so a TERM landing before its own loop took over was
+          swallowed and the pool never finished shutting down.
+
+0.49	2026-09-19
+        - FIX: an HTTP/1.1 tunnel (a 101 stream handle) went deaf after
+          the upgrade on io_uring with completion reads.
+
+0.48	2026-09-17
+        - ADDS: a stream handle opened with status 101 on HTTP/1.1 turns
+          the connection into a tunnel. No Connection: close is added,
+          the handler's return value is discarded as the sentinel a
+          detach leaves, and what the peer sends reaches stream_on_data
+          instead of the request parser. Allowed from a synchronous
+          handler, which every other status still is not. It is how a
+          WebSocket runs over TLS, which conn_detach refuses (-3);
+
+0.47	2026-09-17
+        - FIX: a repeated request header folded with ", " whatever its
+          name, Cookie included. An HTTP/2 client may send each cookie
+          as its own field (RFC 9113 8.2.3) and browsers do, so the app
+          saw "a=1, b=2": a signed session cookie grew a tail, failed
+          its signature, and every request over h2 arrived as a fresh
+          session. Cookie now folds with "; " (RFC 6265) on HTTP/1.1,
+          HTTP/2 and HTTP/3; every other header still folds with ", ".
+
+0.46	2026-09-10
+        - FIX: 0.45 did not compile against any OpenSSL older than 1.1.1.
+          The QUIC context pinned its protocol range with TLS1_3_VERSION
+          and SSL_CTX_set_max_proto_version, which are 1.1.1 and 1.1.0;
+          the constant stopped the build outright and the setter would
+          have been an undefined symbol at load. Both are now compiled
+          out on a library that has neither, leaving the TLS 1.2 floor
+          the TCP listener has always had. HTTP/3 is unaffected: it needs
+          TLS 1.3 to exist at all, and now says so if forced.
+        - FIX: SSL_CTX_set_max_early_data, the 0-RTT refusal, was reached
+          for unguarded on the same libraries. Once the build got past
+          the error above it would have loaded no .so at all.
+
+0.45	2026-09-09
+        - ADDS: HTTP/3 over QUIC (ngtcp2 + nghttp3). `http3 => 1` beside
+          a certificate serves h3 on the same port over UDP, through the
+          same sync, Future and psgi.streaming paths as HTTP/1.1 and
+          HTTP/2. 
+	- ADDS: ABI v8 stream_on_data. A stream handle becomes
+          bidirectional: request bytes go to a callback instead of being
+          buffered into psgi.input, which a tunnelled stream needs
+          because it never ends.
+        - ADDS: Extended CONNECT (RFC 8441 on HTTP/2, RFC 9220 on
+          HTTP/3), the WebSocket handshake for a multiplexed transport.
+        - ADDS: datagrams_out in Hyperman->stats, and bytes_out on
+          HTTP/3 is no longer counted twice.
+        - ADDS: http3_max_conns, and h3_conns / h3_live / h3_requests /
+          datagrams in Hyperman->stats.
+        - FIX: client certificates were not reported over HTTP/3.
+          SSL_CLIENT_VERIFY read NONE for a peer that had presented a
+          valid one, so an application checking it refused a client it
+          should have accepted. mTLS now reports identically on every
+          transport.
+        - FIX: reloading certificates rebuilt the TCP context and left
+          the QUIC one stale, so a fleet served a fresh certificate over
+          TCP and an old one over QUIC. Both are now swapped together or
+          neither is.
+        - FIX: tools/cppcheck.sh reported clean whatever cppcheck found,
+          and never defined HM_HAVE_HTTP3 - so no QUIC or HTTP/3 code had
+          been analysed. Both fixed, and the findings that surfaced.
+        - FIX: an application that answered through a stream handle and
+          then returned a sentinel put TWO responses on one HTTP/2 or
+          HTTP/3 stream. The sentinel is now discarded, as it already
+          was on the detach path.
+        - FIX: HTTP/3 throughput collapsed about 20x under sustained
+          concurrent large responses. A stream blocked by flow control
+          was handed to nghttp3 and never unblocked, because ngtcp2's
+          extend_max_stream_data callback was not registered.
+        - HTTP/3 address validation: Retry above a half-open threshold,
+          NEW_TOKEN so a returning client skips it, and a Stateless
+          Reset for a connection id this server does not hold.
+        - FIX: the depend block missed xs/bus.xs and six headers that
+          Hyperman.xs includes, so a rebuild could test stale objects.
+        - FIX: t/41-stream-abi.t's backpressure test could not reach the
+          high-water mark where a Linux send buffer autotunes past the
+          body, and reported no pause. The client now caps its own
+          receive window and the body outgrows the buffers.
+
+0.44	2026-09-09
+        - psgix.input.buffered is set with the rest of an HTTP/2 request's
+          environment rather than at dispatch, so an application can tell
+          that a bodied h2 request with no content-length is complete.
+        - ADDS: ABI v6 stream handles. One seam writes a response body a
+          piece at a time over HTTP/1.1 or over an HTTP/2 stream, on TLS
+          or in clear, where conn_detach can only hand over a socket.
+        - stream_on_abort reports a stream die under its producer,
+          including an HTTP/2 RST_STREAM on one stream of many.
+        - stream_on_drain and an HM_ABI_STREAM_FULL return give the
+          HTTP/1.1 streaming path backpressure it did not have.
+        - ADDS: Hyperman::stream($env, $status, \@headers), the Perl door
+          onto the same registry, returning a Hyperman::Writer.
+        - ADDS: psgix.hyperman.stream, the [fd, generation, stream id]
+          ticket both doors take. Unlike psgix.hyperman.conn it is
+          present on HTTP/2.
+        - An HTTP/2 body written through a stream handle is framed as it
+          is produced.
+
+0.43	2026-09-04
+        - ADDS: Expect: 100-continue. A client asking permission before a
+          large body gets an interim 100 rather than a stall, and a body
+          over max_body is refused with 413 before it is sent.
+        - An expectation other than 100-continue is 417 Expectation
+          Failed; an Expect from an HTTP/1.0 client is ignored.
+        - FIX: a chunked request whose header block arrived in its own
+          packet was refused with 400. The scanner read "no chunk-size
+          bytes yet" as "no chunk-size".
+
+0.42	2026-09-02
+        - A string failure raised out of a future kept its " at FILE line
+          N." on perls before 5.14. The croak_sv shim raised the message
+          verbatim, so ->get and AWAIT_GET reported no location there.
+        - The croak_sv shim is compiled on every perl and driven by
+          t/38-awaitable.t, rather than only on the perls that use it.
+        - t/38-awaitable.t asserts await cancellation only on perl 5.24+
+
+0.41	2026-09-01
+        - t/38-awaitable.t asserts await cancellation only on
+          Future::AsyncAwait 0.56+.
+        - t/38-awaitable.t reports the Future::AsyncAwait version it ran
+          against.
+
+0.40	2026-09-01
+        - Hyperman::Future implements the Future::AsyncAwait::Awaitable API,
+          so await works inside an async sub.
+        - Hyperman::Future->on_cancel, taking a code reference or a future.
+
+0.39    2026-08-30
+        - A queue-group claim waits on a slot for a second of real time, not
+          for ten thousand yields.
+        - The tests that prove a refusal ignore SIGPIPE, so the client is not
+          killed by the close it asked for.
+
+0.38    2026-08-30
+        - Windows Fixes
+        - XSUB.h rewrites the plain CRT and socket names under PERL_IMPLICIT_SYS
+        - psgi.input is a temp file at every size on Windows. PerlIO_openn
+          is not exported from perl5xx.dll, so :scalar is unreachable there.
+        - A body temp file honours TEMP and TMP, not only TMPDIR.
+
+0.37    2026-08-29
+        - t/32-body-spill.t takes a port from the kernel instead of the pid.
+        - Every forked test server drops the TAP pipe and self-destructs on
+          an alarm, so an unreaped one cannot hang the harness.
+
+0.36    2026-08-27
+        - FIXES: hm_bus.h and hm_atomic.h are now installed and published, so
+          a consumer with Hyperman installed can build the cross-worker bus.
+
+0.35    2026-08-25
+        - ADDS: completion-mode reads on the io_uring backend, on by default
+          there and off with run(completion => 0)
+        - ADDS: kernel TLS, where the OpenSSL build and the kernel both have
+          it: an HTTPS connection gains the writev and sendfile fast paths.
+        - ADDS: Hyperman->has_ktls, and SSL_KTLS in $env for what a given
+          connection actually got.
+        - Plack::Handler::Hyperman passes `completion` through
+
+0.34    2026-08-23
+        - Fix: t/35-bus.t asserted that a queue group's forty messages spread
+          over more than one of four polling children.
+
+0.33    2026-08-23
+        - Fix: t/35-bus.t asserted that a queue group's forty messages spread
+          over more than one of four polling children.
+
+0.32    2026-08-21
+        - A worker no longer goes permanently deaf to the bus. The
+          wakeup's coalescing flag was cleared before its pipe was
+          emptied.
+        - bus_gaps reports what the DISPATCHER dropped as well as what
+          receive() did. 
+
+0.31    2026-08-21
+        - A queue group no longer drops a message because the worker
+          that claimed it looked too early.
+
+0.30    2026-08-20
+        - A request body over 1MB is written to a temp file as it
+          arrives instead of being held in memory, and psgi.input is a
+          handle on that file. Measured end to end through a socket, a
+          128MB upload costs a worker about 15MB of RSS against roughly
+          275MB before.
+        - Make one fewer syscall per request. The read loop drained to
+          EAGAIN, so an ordinary keep-alive request cost three syscalls -
+          a read that returned the request.
+        - Header name comparison no longer depends on the operator's
+          locale. hm_strncasecmp was the C library's, which folds case
+          by LC_CTYPE, and every caller compares an HTTP header name or
+          token - ASCII by RFC 9110. Under a Turkish locale the library
+          folds 'I' to the dotless form, so "CONTENT-LENGTH" would stop
+          matching "Content-Length" and the framing header would go
+          unrecognised. 
+    
+0.29	2026-08-20
+        - The Plack handler passes the bus params through. bus_slots,
+          bus_slot_size and bus_groups.
+        - A queue group registered before the server starts now works.
+
+0.28    2026-08-20
+        - A cross worker message bus. One ring in shared memory, mapped
+          before the fork, so every worker publishes into and reads from
+          the same copy. 
+
+0.27    2026-08-18
+        - Hyperman->on_worker_start(sub { ... }): run code in every
+          worker, after the fork, before its loop starts turning.
+        - Hyperman->deny_add / deny_remove / deny_check / ratelimit_hit:
+          the fork-shared arena, as class methods.
+
+0.26    2026-08-18
+        - hm_abi v4: on_worker_start. A C consumer registers a callback
+          before run(), and the server runs it once in every worker,
+          after the fork, in the child, with that child's own loop, and
+          before the loop starts turning.
+
+0.25    2026-08-17
+        - Response compression: `compress => 1` on run() gzips responses
+          on the way out (needs the zlib build; Hyperman->has_compression
+          reports it, and without zlib the option is accepted and inert).
+        - Hyperman NEVER touches a response that already carries a
+          Content-Encoding. That one rule is the whole contract with
+          whatever sits above: a framework serving precompressed .gz
+          files sets `gzip` and its bytes go out untouched; a route that
+          wants no compression sets `identity`, which is honoured and
+          stripped. A plain response header, so any PSGI framework can
+          use it.
+        - Compression is OFF by default, under run() and under
+          Plack::Handler::Hyperman alike, and both take the same
+          options. Nobody's server starts compressing because they
+          upgraded: whether the CPU is worth paying depends on whether
+          bandwidth or the processor limits the deployment, which only
+          its operator knows.
+        - New run() options: compress, compress_min_length (default
+          1400, one MTU), compress_level. Plack::Handler::Hyperman
+          passes all three through, so `plackup -s Hyperman
+          --compress 1` is the same server.
+
+0.24    2026-08-17
+	- More windows fixes
+
+0.23    2026-08-16
+        - Hyperman attempt to build and serve on native Windows with no 
+          behaviour change on any platform it already ran on
+        - The socket/IO surface now goes through one shim header
+        - A WSAPoll readiness backend (backend_wsapoll.c) behind the
+          existing hm_backend vtable, so Windows has the floor that
+          poll(2) provides everywhere else
+        - The process model is now explicit about what a platform can
+          do. The supervisor half - fork, waitpid, the respawn backoff,
+          the HUP/USR2 recycle and the POSIX signal plumbing - is
+          compiled only where those exist.
+        - Fixed a latent bug in the C ABI selftest, which asserted
+          arena SEMANTICS (add a denylist entry, expect it to be found)
+          without first asking whether this build has an arena. 
+
+0.22    2026-08-16
+        - t/27-sendfile.t asserted the worker's ABSOLUTE RSS stayed
+          under 60MB after a 16MB download, but a worker's absolute
+          size is a property of the perl build - static-libperl and
+          threaded smokers idle at 62-83MB and failed the test with
+          streaming working perfectly. It now measures the GROWTH
+          across the download (baseline RSS before, probe after) and
+          asserts it stays under 8MB
+
+0.21    2026-08-16
+        - New Hyperman->tls_library: the runtime TLS library banner
+          ("OpenSSL 3.0.13 ...", "LibreSSL 3.8.2"), undef without the
+          TLS build - the supported way to tell the two stacks apart.
+        - t/25-tls-session.t no longer fails on LibreSSL (OpenBSD, from
+          CPAN Testers): LibreSSL implements no TLS 1.3 session
+          resumption on either side of a connection, so the resumption
+          checks could never pass there however correct the ticket key
+          was. The ticket-key machinery under test is protocol
+          independent, so on a LibreSSL stack those checks now run over
+          TLS 1.2, where LibreSSL's tickets work.
+
+0.20    2026-08-16
+        - Filehandle and IO-object response bodies stream instead of
+          being slurped into one SV. A glob over a regular file lifts to
+          (fd, position, remaining) - remaining is the Content-Length
+          header when the response carries one.
+        - use sendfile(2) on plaintext HTTP/1 file responses
+
+0.19    2026-08-14
+        - Fixed a build failure on compilers older than GCC 4.7, which
+          took out every perl on FreeBSD 9 (base cc is gcc 4.2.1):
+          hm_ratelimit.h probed for __GNUC__ and then used the __atomic
+          builtins, which arrived five releases later, so the arena
+          added in 0.18 would not compile there at all. It now probes
+          for the builtins themselves and falls back to the older
+          __sync family, which also has everything the arena needs.
+
+0.18    2026-08-13
+        - Abuse controls on a fork-shared arena: an IP denylist enforced
+          at accept and fixed-window rate counters, both in one anonymous
+          shared-memory region mapped before the workers fork, so a limit
+          is exact across the pool rather than per worker. Everything
+          fails open.
+        - run() gains deny => [ips], deny_capacity and rate_capacity. A
+          denylisted peer is dropped at accept, before a connection object
+          is built or a byte is read; a new `denied` worker stat counts it.
+        - hm_abi.h grows to ABI version 3 (append-only): deny_check,
+          deny_add, deny_remove and ratelimit_hit, for consumers such as
+          Punk's rate_limit. Older consumers are unaffected.
+        - Rate-counter slots are reclaimed on demand: a slot whose window
+          has rolled is reused by a new key before a live counter would be
+          evicted, so the table drains when the keys that filled it go
+          quiet rather than thrashing at capacity.
+
+0.17    2026-08-12
+        - TLS session resumption now survives tls_reload. 
+        - HTTPS connections no longer pay a wasted SSL_read on every
+          writable event. 
+        - A TLS connection whose SSL_read blocked wanting a writable
+          socket no longer risks spinning the worker at 100% CPU.
+        - SSL_MODE_RELEASE_BUFFERS, so OpenSSL's record buffers are handed
+          back when they drain instead of being pinned for a connection's
+          whole life - a keep-alive server is mostly idle connections.
+        - A session id context is now set, without which OpenSSL declines
+          to resume any session on a context that verifies peers: every
+          mTLS connection paid a full handshake and a full chain
+          verification.
+        - SNI hostname lookup is a binary search over a sorted, lowercased
+          table rather than a strcasecmp walk of every entry, which is a
+          per-handshake cost that grew with the number of certificates
+          served.
+        - close_notify is no longer written for a connection dropped
+          mid-handshake, where there is no session to shut down.
+        - Tests no longer derive their listening port from $$.
+        - A failed fork during a SIGHUP recycle no longer stores -1 in the
+          child table, where the shutdown sweep would have turned it into
+          kill(-1, SIGTERM) and signalled every process owned by the uid.
+
+0.16    2026-08-12
+        - t/18-tls-advanced.t skips, rather than dies, when the host
+          cannot mint a certificate. 
+        - t/16-http2.t no longer requires curl's --parallel.
+
+0.15    2026-08-10
+        - Hyperman->tls_reload(\%sni): replace a worker's TLS
+          certificates without replacing the process. 
+
+0.14    2026-08-08
+        - An inherited loop's kernel objects are now off-limits to the io
+          and timer watch paths, not just to free. On Linux an epoll
+          instance is a SHARED kernel object across fork - the fd is
+          duplicated but both processes' epoll_ctl calls edit the same
+          interest list - so a forked child that "cleaned up" watchers on
+          a loop it merely inherited was silently deregistering its
+          PARENT's fds.
+
+0.13    2026-08-07
+        - A loop inherited across a fork no longer closes descriptors that
+          are not its own. Every fd in a loop - the backend's own, the
+          connection sockets, the access log - belongs to the process that
+          created the loop, so a loop the child merely inherited is now
+          freed without closing any of them.
+        - Pre-size the PSGI env hash. A fresh HV starts with 8 buckets and
+          the env carries 25-odd keys before the app adds its own, so
+          every request paid two bucket split reallocs and their rehash
+          walks. under profile S_hsplit alone was 4% of a worker's
+          samples. hv_ksplit(64) at both env build sites (HTTP/1 and
+          HTTP/2) removes it outright.
+        - Store the common HTTP_* header keys through shared key SVs made
+          once at init.
+        - Fold header names to their canonical HTTP_ form before matching,
+          so the Content-Length / Content-Type / Transfer-Encoding and
+          Connection tests are plain memcmp on known-case bytes instead of
+          case-blind scans of the wire bytes, per header, per request. The
+          fold maps '-' to '_', so the special names also check the wire
+          byte at the hyphen position - a literal "Content_Length" header
+          stays HTTP_CONTENT_LENGTH rather than aliasing the real one,
+          exactly as before.
+
+0.12    2026-08-06
+        - io_uring: cancelling a timer could corrupt the heap. ur_del_timer
+          freed the ur_timer immediately, but the timeout is already in flight
+          in the kernel and its user_data IS that pointer, so the completion
+          still arrived, was dereferenced, and freed a second time. 
+        - Workers report their own pid again on perl below 5.14. $$ is a plain
+          SV that perl only refreshes inside pp_fork, and hm_spawn forks from
+          C, so every worker in the pool kept reporting the supervisor's pid -
+          and POSIX::getpid is `sub getpid { $$ }`, so that read wrong too.
+        - t/15-process.t asserts the invariant directly: no worker may answer
+          with the supervisor's pid.
+        - t/22-abi.t asserted _abi_ptr returns a positive IV. It returns a raw
+          pointer, and Solaris x86-64 maps shared objects high enough to set
+          the sign bit, so the assertion was wrong rather than the table.
+
+0.11    2026-08-06
+        - Connection detach, the protocol-upgrade seam: Hyperman::detach($env)
+          hands a live HTTP/1 socket to the application. The server stops
+          watching the fd, forgets the connection and does not close it, so
+          the app's own psgix.loop watchers on that fd fire. The app writes
+          its own upgrade response and returns a discarded sentinel
+          ([101, [], []]). This is what a WebSocket layer needs; before it,
+          a hijacked socket kept racing the server's own read watcher.
+        - $env->{'psgix.hyperman.conn'} = [ fd, generation id ] - the ticket
+          detach works from, and the way an app detects that detaching is
+          possible (HTTP/2 streams and other servers do not provide it).
+        - Detach is refused, with a specific message, for HTTP/2 and TLS
+          connections, a stale ticket, a response still draining, and a
+          second detach of the same connection.
+        - 1xx and 426 responses now carry their real reason phrase: a 101
+          serialised as "HTTP/1.1 101 OK" before this.
+
+0.10    2026-08-05
+        - Public C ABI for XS consumers 
+
+0.09    2026-08-04
+        - Chunked request bodies (Transfer-Encoding: chunked) are now decoded
+          (HTTP/1). The decoded body is presented as psgi.input with a matching
+          CONTENT_LENGTH; chunk extensions and trailers are accepted.
+        - Security: harden HTTP/1 request framing against request smuggling
+          (RFC 7230 3.3.3). Transfer-Encoding together with Content-Length, a
+          repeated Transfer-Encoding, or a duplicate/malformed Content-Length
+          (a sign, whitespace, trailing junk, or overflow) is rejected 400; an
+          unsupported transfer coding is 501. All close the connection so no
+          chunk data can be mis-framed as a following pipelined request.
+          t/21-smuggling.t.
+        - Security: the built-in redirect_https listener now truncates the
+          reflected Host and request-target at the first control/space byte, so
+          a bare LF in the Host header cannot inject or split the 301 response.
+          Fuzz harness for the request parser under ASan/UBSan in tools/fuzz/.
+        - Robustness: allocation helpers hm_xmalloc/hm_xcalloc/hm_xrealloc that
+          croak on OOM, so no hot-path allocation dereferences a NULL result.
+          tools/cppcheck.sh runs a static-analysis scan (clean).
+        - PSGI env: add REMOTE_HOST (the peer address, like REMOTE_ADDR),
+          REMOTE_PORT (the peer's port, captured at accept), and
+          psgix.input.buffered => 1 (psgi.input is a seekable in-memory :scalar
+          handle). Set for both HTTP/1 and HTTP/2.
+        - Multiple listeners in one run(). Pass listen => [ {..}, .. ] to bind
+          several listeners, each independently plain or TLS - the driving case
+          being plain :80 beside HTTPS :443 - or port => [80, 8080] as sugar for
+          several plain listeners sharing the top-level options. SERVER_PORT and
+          psgi.url_scheme reflect the listener each request arrived on.
+        - Built-in https redirect. A listener with redirect_https => $port
+          answers every request with a 301 to the same host and target on that
+          https port.
+
+0.07    2026-08-03
+        - Build on OpenSSL older than 1.0.2. ALPN (SSL_CTX_set_alpn_select_cb),
+          used to offer HTTP/2 over TLS, is absent before 1.0.2, so the module
+          linked an undefined symbol and failed to load on such smokers. Guard
+          it behind a version check.
+
+0.06    2026-08-02
+        - Fast default access log. access_log now accepts a file path or an
+          open handle in addition to a coderef: Hyperman then formats an
+          Apache Combined Log Format line in C and appends it directly, with
+          no per-request Perl call on the hot path. 
+        - Populate REMOTE_ADDR in the PSGI env (HTTP/1 and HTTP/2), captured
+          from the peer at accept. Needed by the access log and expected by
+          apps.
+
+0.05    2026-08-02
+        - Various fixes to compile on perls older than 5.16.
+        - Correct MIN_PERL_VERSION from 5.008003 to 5.010000
+
+0.04    2026-08-02
+        - Link -lrt when clock_gettime needs it. backend_poll.c calls
+          clock_gettime(CLOCK_MONOTONIC), which on glibc before 2.17 lives in
+          librt, not libc.
+        - t/12-loop.t: make the persistent-watcher subtest more robust by adding a
+          watcher to prevent the test hanging like it has in some cpantesters environments.
+
+0.03    2026-08-01
+        - TLS: build against pre-1.1.0 OpenSSL. Older releases lack
+          OPENSSL_init_ssl(), the OPENSSL_INIT_LOAD_*_STRINGS constants,
+          TLS_server_method(), and SSL_CTX_set_min_proto_version(); provide
+          a compatibility shim (SSL_library_init + SSLv23_server_method +
+          SSL_OP_NO_* protocol fencing) so hm_tls.h compiles instead of
+          failing with undeclared-identifier errors on those hosts. Also map
+          SSL_get1_peer_certificate to SSL_get_peer_certificate before 3.0.
+        - Makefile.PL: bail out cleanly (NA, not FAIL) on native Windows.
+          Hyperman needs fork, POSIX signals, sockets, sys/uio, and a
+          kqueue/epoll/io_uring/poll backend, none of which MSWin32/MinGW
+          provides (the build previously died on a missing <sys/uio.h>).
+        - t/14-prod.t: bound the respawn/recycle/stats polls by wall-clock
+          time instead of fixed iteration counts. A -9'd worker is respawned
+          with exponential backoff, so on loaded smokers the replacement can
+          lag; the fixed windows produced intermittent failures on the
+          "request counter advanced" and "supervisor respawned a replacement
+          worker" assertions.
+
+0.02    2026-08-01
+        - io_uring backend: assign sqe->user_data directly instead of calling
+          io_uring_sqe_set_data64(), which only exists in liburing >= 2.2 and
+          left the .so with an undefined symbol on hosts with older liburing.
+        - Supervisor: close a signal lost-wakeup race. The pool loop now keeps
+          TERM/INT/HUP/USR1/USR2/CHLD blocked, reaps with WNOHANG, and waits
+          via sigsuspend(), so a USR1 stats dump (or any signal) arriving while
+          the pool is idle is serviced immediately instead of stalling until a
+          worker happened to exit. Fixes intermittent t/15-process.t failures.
+
+0.01    2026-07-31
+        First release.
+        - Event-loop PSGI server: prefork supervisor + per-worker XS loop.
+          Passes the full Plack::Test::Suite; runs any Plack app via
+          `plackup -s Hyperman`.
+        - Pluggable readiness backends behind one C vtable: kqueue
+          (macOS/BSD), epoll (Linux), portable poll fallback, and an opt-in
+          io_uring backend (raw syscalls, poll-mode ring). Selection is
+          automatic; force with HYPERMAN_BACKEND.
+        - Hyperman::Future: native XS array-slot Future-compatible async
+          result. Handlers may return a Future (or any on_ready-compatible
+          object, e.g. CPAN Future) of the PSGI response; get/await pump the
+          worker's own loop re-entrantly.
+        - Async PSGI: psgi.streaming/delayed responder with a streaming
+          writer, psgix.io (dup'd client socket), psgix.loop, cancellation
+          of the response Future on client disconnect, timer and io_ready
+          Futures on the loop.
+        - Production: worker respawn with crash-loop throttle, SIGHUP
+          zero-downtime worker recycle, graceful TERM/INT drain, idle and
+          slow-request timeouts, pipelining fairness cap, request size
+          ceiling with 413, opt-in SO_REUSEPORT per-worker listeners
+          (Linux), access_log callback, Hyperman->stats.

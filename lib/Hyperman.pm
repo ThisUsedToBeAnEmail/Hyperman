@@ -1,0 +1,1741 @@
+package Hyperman;
+
+use 5.010;
+use strict;
+use warnings;
+
+our $VERSION = '0.65';
+
+require XSLoader;
+XSLoader::load('Hyperman', $VERSION);
+
+1;
+
+__END__
+
+=head1 NAME
+
+Hyperman - an event-loop PSGI server
+
+=head1 SYNOPSIS
+
+    use Hyperman;
+
+    my $app = sub { [ 200, [ 'Content-Type' => 'text/plain' ], [ 'Hello' ] ] };
+    Hyperman->run( app => $app, port => 8080, workers => 4 );
+
+    # async: a handler may return a Hyperman::Future of the response
+    my $async = sub {
+        my $env = shift;
+        Hyperman->timer(0.5)->then(sub {
+            [ 200, [ 'Content-Type' => 'text/plain' ], [ 'later' ] ];
+        });
+    };
+
+=head1 DESCRIPTION
+
+Hyperman is a PSGI server built on a prefork supervisor with a per-worker XS
+event loop (L<Hyperman::Loop> over a pluggable readiness backend), aiming to
+match a JIT HTTP server's throughput without a JIT. Handlers may return a
+L<Hyperman::Future> (or any Future-compatible object) of the PSGI response;
+the connection is parked while the worker keeps serving, and awaiting a
+future inside a handler pumps the worker's own loop. Runs any Plack app via
+C<plackup -s Hyperman>.
+
+The entire implementation is XS: the loop, HTTP machinery, Futures, and the
+process model live in C (F<include/hyperman/>), with per-package XS
+interfaces (F<xs/>).
+
+=head2 run
+
+    Hyperman->run(
+        app            => $psgi_app,   # required
+        host           => '0.0.0.0',
+        port           => 8080,        # a scalar, or an arrayref of ports
+                                       # ([80, 8080]) for several plain
+                                       # listeners sharing these options
+        workers        => 0,           # 0/unset = one per CPU; 1 = in-process
+                                       # dev mode (no supervisor)
+        idle_timeout   => 60,          # close idle keep-alive conns (secs)
+        header_timeout => 30,          # slow/partial request guard (secs)
+        body_timeout   => 60,          # a body that stalls this long is dropped
+        max_pipeline   => 32,          # requests per conn per wakeup
+        reuseport      => 0,           # per-worker listeners (SO_REUSEPORT;
+                                       # Linux accept scaling - regressed on
+                                       # macOS, keep off there)
+        access_log     => '/var/log/app.log',  # fast built-in Combined-log
+                                       # writer (a path, or an open handle
+                                       # like \*STDERR). Or pass a coderef
+                                       # for custom logging:
+                                       #   sub { my ($env,$status,$bytes)=@_ }
+                                       # ($bytes is undef for streaming)
+        max_body       => 16777216,    # request ceiling, bytes (see below);
+                                       # the default is 16MB, 0 is refused
+        max_requests_per_worker => 0,  # recycle a worker after N requests
+        shutdown_grace => 30,          # bound on graceful drain (secs)
+        affinity       => 0,           # pin worker i to core i%ncpu (Linux)
+        http2          => 0,           # accept HTTP/2 (h2c, and h2 over TLS via
+                                       # ALPN); needs the nghttp2 build
+        http3          => 0,           # serve HTTP/3 over QUIC on the same
+                                       # port; needs the ngtcp2/nghttp3 build
+                                       # and a certificate
+        http3_max_conns => 1024,       # QUIC connection ceiling per worker
+                                       # (the default; 0 lifts it)
+        tls_cert       => $cert_pem,   # serve HTTPS (needs the OpenSSL build,
+        tls_key        => $key_pem,    # Hyperman->has_tls); both required
+        tls_ca         => $ca_pem,     # verify client certs against this CA
+        tls_verify     => 'require',   # none (default) | optional | require
+        tls_sni        => {            # per-hostname certificates (SNI)
+            'other.example' => { cert => $c2, key => $k2 },
+        },
+        deny           => ['1.2.3.4'], # IPs dropped at accept (see below)
+        deny_capacity  => 1024,        # denylist table size (0 = default)
+        rate_capacity  => 4096,        # rate-counter table size (0 = default)
+        bus_slots      => 2048,        # message bus: ring depth
+        bus_slot_size  => 2048,        # ... and the largest message
+        bus_groups     => 64,          # ... and how many named queue groups
+        arena_name     => 'app',       # Shared::Arena name (default: anonymous)
+        arena_size     => 8_000_000,   # ... and its bytes (default: computed)
+        distinct_clients => 0,         # count distinct peers at accept (see
+                                       # "Pool state"; costs ~20ns an accept)
+        user           => 'www',       # drop to this user after binding
+        group          => 'www',       # ... and this group (default: the
+                                       # user's primary group)
+        umask          => 0077,        # set before the first fork
+        pid_file       => '/run/app.pid',
+    );
+
+The event backend is chosen automatically (kqueue, io_uring, epoll, then poll) and can
+be forced with C<HYPERMAN_BACKEND>.
+
+B<Completion-mode reads.> On the io_uring backend the kernel is asked for each
+read up front instead of being waited on to say a socket is readable, so the
+bytes are already in the buffer when the loop hears about them and the read
+stops being a syscall of its own - it becomes part of the single batched
+submission each turn of the loop makes anyway. Measured over 2000 keep-alive
+requests on 50 connections:
+
+    readiness    read 10050  writev 10000  enter 222   2.02 syscalls/request
+    completion   read     0  writev 10000  enter 203   1.02 syscalls/request
+
+The remaining syscall is the C<writev> that sends the response.
+
+This is B<on by default wherever it is available>, which is the io_uring
+backend and only when that backend was asked for by name - nothing
+auto-selects it. C<< run(completion => 0) >> turns it off, and
+C<HYPERMAN_COMPLETION> does the same from the environment the way
+C<HYPERMAN_BACKEND> overrides the chooser; the C<run> option wins over the
+environment variable, being the more specific statement. C<<
+Hyperman::Loop->new('io_uring', completion => 0) >> is the loop-level
+spelling.
+
+TLS connections keep reading through OpenSSL, since the bytes on the socket
+are ciphertext. Every other backend is untouched: they do not offer the
+operation, the option is accepted and inert, and the loop reads for itself
+exactly as before.
+
+B<Fewer syscalls has not meant faster>, and it is worth saying so. On a
+virtualised Linux the same workload costs about 4.2us of server CPU per
+request under io_uring and about 2.9us under epoll, so epoll is ahead while
+issuing twice the syscalls. Completion mode is a clear improvement on
+io_uring in poll mode (roughly 4.7us to 4.2us) but it does not close that
+gap. io_uring stays off the auto-selection list until that is understood on
+real hardware.
+
+C<bus_slots> and C<bus_slot_size> answer two different complaints and it is
+worth knowing which is which: raise C<bus_slots> when a burst is outrunning a
+reader (the symptom is a climbing C<gaps> count), and C<bus_slot_size> when a
+publish is refused for being too big. The default 2048 x 2KB costs four
+megabytes of shared memory for the whole pool. See L</The message bus>.
+
+=head2 Multiple listeners
+
+A single C<run> can bind several listeners, each independently plain or TLS -
+the common case being plain B<:80> beside HTTPS B<:443>. Pass C<listen> an
+arrayref of per-listener hashrefs; each takes its own C<port> (required) plus
+any of C<host>, C<tls_cert>, C<tls_key>, C<tls_ca>, C<tls_verify>, C<tls_sni>,
+C<http2>, C<http3>, and C<redirect_https>. A missing per-listener field falls back to the
+top-level value of the same name, and the top-level C<port>/C<listen> are
+mutually exclusive shorthands - C<< port => [80, 8080] >> is sugar for several
+plain listeners sharing the top-level options.
+
+    Hyperman->run(
+        app     => $app,
+        workers => 8,
+        listen  => [
+            { port => 80,  redirect_https => 443 },   # 301 every request to https
+            { port => 443, tls_cert => $cert, tls_key => $key },
+        ],
+    );
+
+C<redirect_https> makes a listener answer B<every> request with a C<301> to the
+same host and request-target on the given https port (in C, before the app is
+reached); the value is that target port, and a bare true value means the
+standard C<443>. Its C<SERVER_PORT> and, for TLS listeners, C<psgi.url_scheme>
+reflect the listener the request arrived on. All listeners serve the one C<app>.
+Ports below 1024 (80, 443) still require the process to start as root or hold
+C<CAP_NET_BIND_SERVICE>.
+
+=head3 host: IPv4, IPv6, or a name
+
+    host => '127.0.0.1'      # one IPv4 interface
+    host => '::'             # every IPv6 interface
+    host => '[::1]'          # brackets are accepted
+    host => 'app.internal'   # a name, resolved once at startup
+
+A listener's host is resolved once, when the server starts, and bound as
+what it resolved to. An IPv6 listener is IPv6 only, so C<'::'> and
+C<'0.0.0.0'> can both be listed on one port. A host that does not resolve is
+refused before anything is bound; it is never replaced by every interface.
+C<REMOTE_ADDR> is the client's address in the listener's family (C<::1> for
+a loopback IPv6 client), and C<SERVER_NAME> is the host as it was given.
+Under C<plackup -s Hyperman>, C<--listen '[::1]:8080'> is the IPv6 spelling.
+
+=head3 path: a unix-domain listener
+
+    listen => [ { path => '/run/app.sock', mode => 0660 } ]
+
+A listener may be a filesystem path instead of a host and port, for a
+reverse proxy on the same machine (nginx: C<proxy_pass http://unix:/run/app.sock:;>).
+A stale socket file from an earlier run is replaced; a regular file at the
+path is refused. C<mode> sets the socket file's permissions (a number or an
+octal string). A path listener has no peer address, so C<REMOTE_ADDR>,
+C<REMOTE_HOST> and C<REMOTE_PORT> are absent from C<$env>, C<SERVER_NAME> is
+the path and C<SERVER_PORT> is 0; the denylist and the rate limiter, which
+key on the peer address, do not apply to it. TLS works on a path listener,
+HTTP/3 does not (QUIC is UDP over IP), and C<reuseport> is refused with one,
+because each worker's rebind would unlink the others' socket. Under
+C<plackup -s Hyperman>, a C<--listen> value containing a C</> is a path.
+
+=head3 inherit, listen_fds: socket activation
+
+    listen     => [ { host => '0.0.0.0', port => 80, inherit => 1 } ]
+    listen_fds => 1          # every listener is inherited
+
+A service manager that binds the sockets itself (systemd's C<.socket> units)
+hands them to the server as descriptors 3 and up, with C<LISTEN_FDS> naming
+how many and C<LISTEN_PID> naming the process they were handed to. A listener
+marked C<inherit> takes the next of them in order instead of binding, after
+checking it is a listening socket of the family the listener resolved to;
+C<listen_fds> marks them all. Both variables are removed from the environment
+at once, so a worker, or a server the application forks, never adopts them
+again. An inherited listener cannot carry C<http3>, and C<reuseport> is
+refused with one.
+
+    # app.socket
+    [Socket]
+    ListenStream=/run/app.sock
+    ListenStream=0.0.0.0:80
+    # app.service
+    [Service]
+    ExecStart=/usr/bin/plackup -s Hyperman --listen_fds 1 --listen /run/app.sock --listen 0.0.0.0:80 app.psgi
+
+=head3 Reloading: HUP and USR2
+
+    kill -HUP  $(cat /run/app.pid)    # refork the pool, same code
+    kill -USR2 $(cat /run/app.pid)    # a new supervisor, freshly compiled
+
+C<HUP> forks a fresh pool from the running supervisor and retires the old
+workers one for one: new processes, the application as it was compiled when
+the server started. It is the reload for a certificate change
+(C<tls_reload>) or a leaking worker, and the supervisor's pid does not
+change.
+
+C<USR2> is the reload for a code deploy. The supervisor starts a successor
+in a fresh perl, with the same interpreter and arguments it was started
+with, so the application is compiled again. The successor adopts the bound
+listeners from its environment instead of binding them, so the ports are
+never released and no connection is refused; it attaches the arena when
+C<arena_name> names one, so the denylist, the rate counters and the bus
+carry over (an anonymous arena cannot be attached, and the successor starts
+a fresh one); it forks its pool, waits for every worker to be on the
+scoreboard, and only then asks the old supervisor to drain with
+C<shutdown_grace>. The pid file then names the successor, so a service
+manager should watch the file rather than the process it started.
+
+A successor that fails to start - a compile error in the new code, a port
+the new configuration adds that is already taken - exits, the old supervisor
+logs it and keeps serving, and nothing has changed. A second C<USR2> while
+one is still starting is ignored and logged.
+
+The successor's workers attach the arena by name and cannot use the wakeup
+pipes the old pool created, so they poll the bus every fifty milliseconds
+instead of being poked: a published message reaches them a little later, and
+always.
+
+A supervisor that dropped privileges starts its successor as the dropped
+user: the successor finds itself already the configured C<user> and C<group>
+and carries on, and the pid file, owned by that user, is rewritten in place.
+Sockets adopted from a service manager (C<listen_fds>) are handed on exactly
+as bound ones are.
+
+=head3 Signals and the application's children
+
+The supervisor and the workers handle C<TERM>, C<INT>, C<HUP>, C<USR1> and
+C<USR2> themselves, in C, and the workers keep them blocked or ignored while
+they serve. A handler that sets C<$SIG{TERM}> is therefore not called for
+the server's own shutdown, and a process the application starts with
+C<system>, backticks or a piped C<open> inherits those dispositions: it will
+not die of a C<TERM> or an C<INT> unless it installs handlers of its own.
+Reset them in the child, or run such programs under a wrapper that does.
+
+=head3 proxy_protocol
+
+    listen => [ { port => 8080, proxy_protocol => 1 } ]
+    proxy_protocol => 1       # for every listener
+
+A listener that reads the PROXY header believes it: the address it names
+becomes the client for the denylist, the rate limiter and the access log.
+There is no list of trusted proxies, so such a listener must be reachable
+only from the proxy (a private network, a firewall rule, a unix socket);
+anyone else who can connect to it can claim any address.
+
+Behind HAProxy or a load balancer that speaks the PROXY protocol, each
+connection opens with one header naming the real client. A listener with
+C<proxy_protocol> reads that header first, versions 1 and 2, before TLS and
+before any request byte, and from then on C<REMOTE_ADDR> and C<REMOTE_PORT>,
+the access log, the denylist and the rate limiter see the client rather than
+the proxy. The proxy's own address is in C<$env> as C<psgix.proxy_addr>.
+
+It is strict and per listener, which is what makes it safe: a connection on
+such a listener that does not begin with a PROXY header is closed, and a
+PROXY header sent to a listener without the option is an invalid request
+line and a 400, so no client can choose its own address by sending one. A
+header that names no address (v1 C<UNKNOWN>, v2 C<LOCAL>, or a family other
+than TCP over IP) leaves the accepted address in place. A header that never
+completes is closed by C<header_timeout>. The denylist is checked twice, for
+the proxy at accept and for the client once the header has been read, so a
+misbehaving proxy can be blocked too. With C<http3> the option applies to
+the TCP side only.
+
+=head3 access_log
+
+When C<access_log> is a path or an open filehandle, Hyperman formats an
+Apache-style Combined Log Format line
+
+    host - user [dd/Mon/YYYY:HH:MM:SS +ZZZZ] "METHOD URI PROTO" status bytes "referer" "ua"
+
+entirely in C and appends it to the file, with no per-request Perl call on
+the hot path. The timestamp is cached and recomputed at most once a second,
+lines are buffered and flushed once per event-loop wakeup, and a file target
+is opened once in the parent and shared C<O_APPEND> across workers so their
+lines stay interleaved without tearing. Quoted fields are escaped, so a
+hostile URI or User-Agent cannot forge a log line. C<REMOTE_ADDR> is captured
+at accept and is also visible to the app in C<$env>.
+
+Pass a coderef instead (C<< sub { my ($env, $status, $bytes) = @_ } >>) for
+full control; that path calls back into Perl for every response.
+
+=head3 access_log_format
+
+    access_log_format => '%h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"'
+    access_log_format => 'json'
+
+What each line says, in Apache's directives. The default is the Combined
+line above. The format is read once when the server starts, so a directive
+it does not know is refused there and no request pays for the parsing.
+
+    %h %a   REMOTE_ADDR          %l      always "-"
+    %u      REMOTE_USER          %t      [dd/Mon/YYYY:HH:MM:SS +ZZZZ]
+    %r      METHOD URI PROTO     %s %>s  status
+    %b      bytes, "-" if unknown %B      bytes, 0 if unknown
+    %D      microseconds taken   %T      seconds taken
+    %p      SERVER_PORT          %v      SERVER_NAME
+    %m      REQUEST_METHOD       %U      PATH_INFO
+    %q      ?query, or nothing   %H      SERVER_PROTOCOL
+    %P      the worker's pid     %%      a percent sign
+    %{Name}i   a request header  %{Name}e   any $env key
+
+Every value is escaped, so no header or path can forge or split a line.
+C<%D> and C<%T> are measured from the moment the request was parsed, and
+only a format that uses them pays for the clock reading; the moment is also
+visible to the application as C<psgix.request_start>, seconds since the
+epoch.
+
+C<json> writes one object per line instead: C<time> (ISO 8601), C<remote_addr>,
+C<user>, C<method>, C<uri>, C<protocol>, C<status>, C<bytes>, C<referer>,
+C<user_agent> and C<duration_us>, with numbers unquoted and a missing value an
+empty string (or C<null> for the numbers).
+
+=head3 error_log
+
+    error_log => '/var/log/app/error.log'    # or an open filehandle
+
+Where the server's own messages go: a handler that died, a response header
+refused, a worker that stopped updating its scoreboard row, a certificate
+reload that failed. Each line carries a timestamp and the writing pid, and
+is written whole so workers do not interleave. Without it they go to
+C<STDERR>, as they always have. C<psgi.errors> is the application's stream
+and is not moved by this.
+
+=head3 user, group, umask, pid_file
+
+    Hyperman->run(app => $app, port => 80, user => 'www', pid_file => '/run/app.pid');
+
+A server started as root to bind a port below 1024 should not stay root.
+With C<user> (a name or a uid), the parent binds every listener, opens the
+logs and creates the arena, writes the pid file, and then drops to that user
+before the first worker is forked, so the supervisor and every worker run as
+it. C<group> names the group (default: the user's primary group), and the
+supplementary groups are set from the user's entry. A user or group that does
+not exist is refused before anything is bound, and a drop that fails is a
+croak, never a server that carries on as root. A numeric C<user> with no
+passwd entry (a container with no C</etc/passwd>) has no primary group to
+take, so it needs C<group> as well and is refused without it.
+
+C<umask> is applied before anything is created, so the unix socket, the pid
+file and the logs come out under it; it is given as a number (C<0077>) or a
+string of octal digits. C<pid_file> is written whole and renamed into place,
+holds the supervisor's pid (the worker's own in single-worker mode), and is
+owned by C<user> once the drop is configured, so that a C<USR2> successor,
+which is born as that user, can rewrite it. It is removed at exit if it still
+holds that pid; where the directory no longer allows that (C</run> after a
+drop) it is emptied instead.
+
+C<reuseport> with C<user> refuses a port below 1024, because the workers
+rebind it themselves and would do so as the dropped user. None of these four
+is supported on Windows.
+
+=head2 max_body: the request ceiling
+
+C<max_body> is the largest request Hyperman will accept - B<headers plus
+body>. Over it, the request is answered C<413 Payload Too Large> and the
+connection is closed. The default is B<16MB>. On HTTP/2 and HTTP/3 the same
+ceiling applies to each stream's body: the stream is answered 413 and the
+rest of it is dropped unread, while the connection carries on. A request
+header block is bounded at 64KB on every transport.
+
+    Hyperman->run(app => $app, max_body => 64 * 1024 * 1024);
+
+=head3 It is no longer a memory ceiling
+
+It used to be one, and the two are worth telling apart now that they are
+different numbers.
+
+A body larger than B<1MB> is written to a temp file as it arrives, and
+C<psgi.input> is a handle on that file rather than a second copy in memory.
+So the memory a request costs is bounded by that threshold, not by
+C<max_body> - a 128MB upload measured at about 15MB of worker RSS, against
+roughly 275MB before the change.
+
+Which means C<max_body> can be raised for large uploads without raising what
+a worker holds. It is a policy ceiling now: how large a request this service
+is willing to accept, and the thing standing between a form and a full
+filesystem.
+
+The temp file is unlinked the moment it is created, so the handle is its only
+reference. It goes away when the request ends, when a handler dies, or when
+the worker is killed - there is nothing to clean up and nothing on disk for
+another process to find. C<TMPDIR> chooses where it lives, or C<TEMP> then
+C<TMP> on Windows.
+
+Two limits, stated plainly:
+
+=over 4
+
+=item * The threshold is a build-time constant (C<HM_SPILL_BODY>), not yet a
+run-time option. B<On Windows every body takes the file>, whatever its size.
+
+=item * B<Chunked bodies are not spilled.> There is no C<Content-Length> to
+divert on and the decoder wants the octets contiguous, so a
+C<Transfer-Encoding: chunked> request still accumulates in memory and is still
+bounded by C<max_body>.
+
+=back
+
+=head2 What the server does to a request and a response
+
+Rules every transport applies, so an application need not:
+
+=over 4
+
+=item * A C<HEAD> request is answered with the headers the C<GET> would have
+carried, C<Content-Length> included, and no body - whatever the application
+returned.
+
+=item * Every response carries a C<Date> header unless the application set
+one.
+
+=item * A request header whose name contains an underscore is dropped. It
+would land in C<$env> under the same C<HTTP_*> key as the hyphenated name,
+which is how a header a proxy in front has vetted gets overwritten by one it
+did not look at.
+
+=item * Whitespace before a header's colon, a bare LF or CR inside the header
+block, an empty request line and a chunk-size line longer than sixteen
+digits are answered C<400> and the connection is closed. Each is a framing
+ambiguity another intermediary might resolve the other way.
+
+=item * A response header name or value carrying CR, LF or NUL is refused:
+the client gets a C<500> and a line goes to C<STDERR>. Such a header splits
+the response, and the server is the last place that can be caught.
+
+=item * C<REMOTE_ADDR>, C<REMOTE_HOST>, C<SERVER_NAME>, C<SERVER_PORT> and
+C<psgi.errors> are fresh values on every request, so a middleware that
+assigns to one of them affects that request only.
+
+=item * A connection that pipelines requests without reading its responses
+holds at most 1MB of them; the rest are served as it drains.
+
+=back
+
+=head3 header_timeout and body_timeout
+
+A request is timed in two phases. Until its header block is complete it has
+C<header_timeout> (30 seconds) from its first byte, which is what stops a
+client that trickles headers to hold a connection. Once the headers are in
+and a body is arriving, the clock measures progress instead: a body that has
+not delivered a byte for C<body_timeout> (60 seconds) is dropped, however
+long it has been coming, and an upload that keeps moving is never cut off
+for being large. A connection that has finished a request and sent nothing
+since is closed after C<idle_timeout>. All three are checked by a sweep that
+runs every five seconds, so each is honoured to within that.
+
+Progress alone lets a body arrive a byte a minute for as long as it likes,
+holding a connection and a buffer the whole time. Two floors are available
+for a deployment that cannot afford that, both off by default:
+C<body_min_rate> is an average in bytes per second a body must sustain,
+judged from two seconds into it, and C<request_timeout> is a ceiling in
+seconds on the whole request from its first byte to the last of its body,
+whatever its progress.
+
+    Hyperman->run(app => $app, body_min_rate => 1024, request_timeout => 300);
+
+=head2 Expect: 100-continue
+
+A client with a large body to send may ask permission first - C<Expect:
+100-continue> - and wait for an interim C<100 Continue> before spending the
+upload. Hyperman answers, and nothing is required of the application: this is
+transport, and it is over before the app is called.
+
+    POST /upload HTTP/1.1
+    Content-Length: 104857600
+    Expect: 100-continue
+                                    <- HTTP/1.1 100 Continue
+    ...the body                     -> and only now
+
+The permission is worth having because a server that never answers does not
+break such a client, it B<stalls> it - for however long that client waits
+before giving up and sending anyway, which is a second in curl and in most of
+the Java clients, on every request.
+
+The B<refusal> is worth more. C<max_body> is decided on the headers, so a
+request declaring more than the ceiling is answered C<413> with the client
+still waiting - it never sends the body, and the worker never reads it. The
+same is true of the ordinary refusals in front of an upload: whatever answers
+before the body is what the client gets.
+
+The details, none of which an application sees:
+
+=over 4
+
+=item * The interim response is sent B<once per request>, and only when the
+body is not already here. A request that arrives whole is answered with its
+final status instead, which RFC 9110 allows and every client handles.
+
+=item * An expectation this server does not understand - anything that is not
+exactly C<100-continue> - is C<417 Expectation Failed> rather than a silence
+the client would read as a stall.
+
+=item * An C<Expect> from an B<HTTP/1.0> client is ignored, as RFC 9110
+requires: it is not waiting for an interim response and would read one as the
+response itself.
+
+=item * C<HTTP_EXPECT> is still in C<$env>. The header the client sent is not
+hidden, and an application that wants to know it was asked can look.
+
+=item * HTTP/2 has no 100-continue handshake of this kind; the h2 path is
+unaffected.
+
+=back
+
+=head2 Response compression
+
+With C<< compress => 1 >>, responses are gzipped on the
+way out.
+
+    Hyperman->run(app => $app, compress => 1);
+
+B<Off by default>, here and under L<Plack::Handler::Hyperman>. A server
+that starts compressing because it was upgraded is a surprise, and the
+cost is real - see the C<compress_level> table below. Whether it is worth
+paying depends on whether bandwidth or CPU is what limits a given
+deployment, which is something only its operator knows.
+
+A response is compressed only when B<all> of these hold:
+
+=over 4
+
+=item * the request's C<Accept-Encoding> accepted gzip (C<q=0> is an
+explicit refusal and is honoured)
+
+=item * the response carries B<no C<Content-Encoding> of its own>
+
+=item * the body is a plain in-memory body, not a filehandle, reader or
+streamed source - compressing those would undo the sendfile and drip paths
+
+=item * it is at least C<compress_min_length> bytes (default 1400, one MTU)
+
+=item * the status is 200 or 203 - never 206, whose C<Content-Range>
+describes offsets into the B<uncompressed> representation
+
+=item * the C<Content-Type> is on the compressible allowlist: C<text/*>,
+C<application/json>, C<application/javascript>, C<application/xml>,
+C<application/x-ndjson>, C<image/svg+xml>, and anything ending C<+json> or
+C<+xml>. An allowlist, so a new binary media type never becomes
+compressible by default.
+
+=back
+
+=head3 The C<Content-Encoding> contract
+
+B<Hyperman never touches a response that already declares a
+C<Content-Encoding>.> That one rule is the whole interface with whatever is
+above it:
+
+=over 4
+
+=item * a framework serving precompressed C<.gz> files off disk sets
+C<gzip>, and its bytes go out as they are
+
+=item * a route that wants no compression sets C<< Content-Encoding:
+identity >>, which Hyperman honours and B<strips> before writing
+
+=back
+
+It is a plain response header, so it is a contract any PSGI framework can
+use rather than a private arrangement. L<Punk>'s C<< { compress => 0 } >>
+route option is exactly this spelling.
+
+=head3 Two things it changes about your response
+
+B<The C<ETag> is rewritten> - a C<-gzip> suffix is added inside the closing
+quote. The layer that compresses must be the layer that fixes the
+validator, or a shared cache serves the compressed bytes to a client that
+asked for none. nginx does the same. It is said plainly here because
+otherwise an application author finds it by debugging.
+
+B<C<Vary: Accept-Encoding> is added> whenever a response was compressed, for
+the same reason.
+
+An app-supplied C<Content-Length> is replaced, since it described the bytes
+that were just replaced.
+
+=head3 C<compress_level>
+
+Default 1, not the customary 6, on measurement rather than convention. A
+37KB JSON document, 2 workers / 5s / 64 connections on loopback:
+
+    off        130,000 req/s    37.3 KB/req
+    level 1     66,900 req/s     3.19 KB/req   11.7x smaller, 1.9x slower
+    level 6     26,300 req/s     2.96 KB/req   12.6x smaller, 4.9x slower
+
+Level 6 buys 7% more compression for 2.5x the CPU. Almost all of the win on
+repetitive text - which is what an API payload is - lands in the first
+level. Raise it with C<< compress_level => 6 >> if bandwidth costs you more
+than CPU does; the range is 1 to 9.
+
+B<Read that table carefully: a loopback benchmark charges the whole CPU
+cost and pays none of the benefit, because the network is free.> It is the
+worst case for compression and the best case for sending 37KB uncompressed.
+Once the link is finite, the same two numbers say the opposite thing -
+requests actually served, taking whichever of CPU and bandwidth binds
+first:
+
+    link        without gzip    with gzip    winner
+    100 Mbps             327        3,827    gzip, 11.7x
+    1 Gbps             3,273       38,267    gzip, 11.7x
+    10 Gbps           32,727       66,900    gzip, 2.0x
+    25 Gbps           81,817       66,900    uncompressed, 1.2x
+    40 Gbps          130,000       66,900    uncompressed, 1.9x
+
+Compression loses only above roughly 20 Gbps of egress per host, which is
+not a situation a PSGI application is usually in. Below that, halving the
+CPU per response buys nothing because the CPU was not the constraint.
+
+Small responses are unaffected either way: anything under
+C<compress_min_length> is never touched, and a benchmark of tiny bodies
+measures no difference at all.
+
+=head3 Without zlib
+
+C<compress> and C<compress_min_length> are accepted and inert, so one
+configuration is portable across builds. C<< Hyperman->has_compression >>
+is the honest answer.
+
+=head2 HTTP/2
+
+With C<< http2 => 1 >> (requires the nghttp2 build; C<< Hyperman->has_http2 >>
+reports it), a connection whose first bytes are the HTTP/2 preface is served
+as cleartext HTTP/2 (h2c, prior knowledge) via L<nghttp2|https://nghttp2.org>:
+multiplexed streams, HPACK, and flow control, with each stream dispatched to
+the app like any request (sync, C<Hyperman::Future>, or C<psgi.streaming>
+responses all work). HTTP/1.1 remains the default on the same port.
+
+The environment is the HTTP/1.1 one: C<psgi.url_scheme> says what the
+connection is, not what the client's C<:scheme> claimed; C<HTTP_HOST> comes
+from C<:authority>; and over TLS the C<HTTPS> and C<SSL_*> keys are set
+exactly as they are for an HTTP/1.1 request. A stream the client resets
+before its response is ready has that response's Future cancelled, as a
+closed HTTP/1.1 connection does.
+
+=head2 HTTP/3
+
+With C<< http3 => 1 >> alongside C<tls_cert>/C<tls_key>, the listener also
+binds a UDP socket on the same port and serves B<HTTP/3 over QUIC>
+(L<ngtcp2|https://nghttp2.org/ngtcp2/> for the transport,
+L<nghttp3|https://nghttp2.org/nghttp3/> for the protocol). Requests arrive
+through the same sync, C<Hyperman::Future> and C<psgi.streaming> paths as
+HTTP/1.1 and HTTP/2, so an application does not change when the transport
+does. C<SERVER_PROTOCOL> is C<HTTP/3> and C<psgi.url_scheme> is always
+C<https>.
+
+Clients discover it through C<Alt-Svc>, which is emitted on the HTTP/1.1 and
+HTTP/2 responses of a listener with C<http3> on, and never on an HTTP/3 one.
+That is also why the TCP listener's ALPN list is unchanged: HTTP/3 is not
+negotiated over TCP.
+
+Client certificates work over HTTP/3 exactly as they do over HTTP/1.1 and
+HTTP/2 - C<tls_verify>/C<tls_ca> apply, and C<SSL_CLIENT_VERIFY>,
+C<SSL_CLIENT_S_DN> and C<SSL_CLIENT_I_DN> reach C<$env> the same way. A QUIC
+handshake is a TLS handshake. C<SSL_KTLS> is always C<0> there, because there
+is no kernel record layer for QUIC.
+
+C<tls_reload> rebuilds the QUIC context with the TCP one, and swaps both or
+neither: a listener serving a fresh certificate over TCP and a stale one over
+QUIC is a mismatch no TCP-only monitor would see.
+
+L</detach> is refused on HTTP/3 for the reason it is refused on HTTP/2 - the
+streams share one connection, and there is no descriptor that means "this
+stream". L<Hyperman/stream> is the seam that does work there.
+
+C<< Hyperman->has_http3 >> reports whether the support was compiled in,
+which needs all of L<ngtcp2|https://nghttp2.org/ngtcp2/>,
+C<ngtcp2_crypto_ossl>, L<nghttp3|https://nghttp2.org/nghttp3/> and OpenSSL
+3.5 or newer. C<< Hyperman->quic_library >> returns the runtime banner for
+the stack (C<"ngtcp2 1.25.0, nghttp3 1.18.0">) or C<undef> when it was not
+built - both libraries, because a QUIC problem is as often one as the other.
+
+C<http3> is per-listener as well as top level, and requires
+C<tls_cert>/C<tls_key>: QUIC's handshake is a TLS handshake, so there is no
+cleartext mode the way there is C<h2c>. It is refused with a reason on a
+build without the libraries, and refused again without a certificate, rather
+than starting a listener that cannot speak. LibreSSL has no ngtcp2 crypto
+backend at all, so C<has_http3> is false there however the rest is built.
+
+B<Address validation.> A QUIC server sends its whole first flight, certificate
+included, to an address it has not yet heard back from, so a spoofed source
+address would make it an amplifier. Two things prevent that, and neither costs
+an idle server anything. A B<Retry> is demanded once a worker is carrying more
+half-open handshakes than its threshold: the client must come back echoing a
+token, which proves it can receive at the address it claims, at the price of
+one round trip. And a B<NEW_TOKEN> is issued after every completed handshake,
+so a returning client skips validation entirely and pays no round trip even
+while everyone else is being retried. Both are bound to the address they were
+issued to and verified against a secret generated once before the workers fork
+- per worker would not survive C<SO_REUSEPORT>, which can land a client's token
+on a worker that did not mint it.
+
+A packet naming a connection this server does not have - the usual cause being
+a client still talking across a restart - is answered with a B<Stateless
+Reset>, so the client gives up now instead of retrying to its idle timeout.
+That reply is always smaller than the packet that provoked it.
+
+One source address may hold at most 32 half-open QUIC handshakes at a time;
+an Initial from an address at that limit is dropped, whatever the global
+count. C<http3_max_conns> caps live QUIC connections per worker (1024 by default;
+0 lifts the cap); past it, new handshakes are dropped rather than queued.
+Each accepted Initial costs an SSL object and a transport state that live
+until the idle timeout, and no descriptor is consumed, so without a cap
+there is nothing that stops a flood of them.
+C<< Hyperman->stats >> reports C<h3_conns> (handshakes completed),
+C<h3_live> (open now) and C<datagrams>.
+
+=head2 Extended CONNECT (WebSocket over HTTP/2 and HTTP/3)
+
+HTTP/2 and HTTP/3 have no C<101>, no C<Upgrade> header, and forbid
+C<Connection>, so the HTTP/1.1 WebSocket handshake cannot happen on them at
+all. RFC 8441 and RFC 9220 replace it: the server advertises that it
+understands the C<:protocol> pseudo-header, and a client then opens an
+ordinary stream with C<< :method = CONNECT >> and C<< :protocol = websocket >>.
+The answer is a C<200>, and the stream stays open carrying frames both ways.
+
+Hyperman advertises this on both transports and needs no configuration for
+it. A request that arrives this way is dispatched like any other, with one
+extra key:
+
+    $env->{'psgix.connect_protocol'}   # 'websocket', or absent
+
+Two things about such a stream differ from an ordinary request, and both
+follow from it having no end. It is dispatched when its B<headers> are
+complete rather than when the request ends, because it does not end. And its
+body is not accumulated into C<psgi.input>, which would grow without bound -
+an application reads it through the C ABI's C<stream_on_data> instead, and
+answers through L</stream>. See L</Stream handles>.
+
+The framing that then runs over the stream is RFC 6455 and is the
+application's business; Hyperman carries the bytes.
+
+=head2 TLS / HTTPS
+
+With C<tls_cert>/C<tls_key> (PEM paths; requires the OpenSSL build,
+C<< Hyperman->has_tls >>), the listener serves HTTPS: a non-blocking TLS
+handshake is driven on the event loop, then reads/writes go through OpenSSL.
+The certificate and key are validated once before forking, so a bad pair
+fails fast. Combined with C<< http2 => 1 >>, ALPN negotiates B<h2> vs
+B<http/1.1> per connection on the same port - the path browsers use for
+HTTP/2. C<psgi.url_scheme> is C<https> for TLS requests, and C<HTTPS> is set
+to C<on>.
+
+B<Client certificates (mTLS).> C<tls_verify> (C<optional>/C<require>, with
+C<tls_ca> as the trust anchor) requests and checks a client certificate;
+C<require> fails the handshake without a valid one. The result is surfaced in
+C<$env> the mod_ssl way: C<SSL_CLIENT_VERIFY> (C<SUCCESS>/C<FAILED>/C<NONE>),
+C<SSL_CLIENT_S_DN>, C<SSL_CLIENT_I_DN>, plus C<SSL_PROTOCOL>/C<SSL_CIPHER>.
+
+B<SNI (multiple certificates).> C<tls_sni> maps hostnames to their own
+C<cert>/C<key>; the certificate is chosen from the TLS ServerName, falling
+back to C<tls_cert>/C<tls_key>. See L</tls_reload> for replacing that map
+while the server is running.
+
+B<Kernel TLS (kTLS).> Where the platform supports it, the record layer moves
+into the kernel once the handshake is done: the socket itself encrypts, so an
+HTTPS response takes the same C<writev> and C<sendfile> fast paths a plaintext
+one takes instead of copying through OpenSSL. Three things must agree - an
+OpenSSL built with C<enable-ktls> (C<< Hyperman->has_ktls >> reports whether
+the code was compiled in), a kernel with the TLS upper-layer protocol
+(Linux 4.13+ with C<CONFIG_TLS>, or FreeBSD), and a negotiated cipher the
+kernel can offload. Any of them declining is normal and costs nothing: the
+connection encrypts in userspace exactly as it always did.
+
+Because all three can decline silently, and a server that failed to offload
+looks precisely like one that succeeded, C<$env> carries C<SSL_KTLS> - C<1>
+when the kernel took the send side of I<that> connection, C<0> otherwise. It
+is the only way to confirm kTLS is doing anything, and worth checking once on
+any host where it is expected to be on.
+
+B<The library.> C<< Hyperman->tls_library >> returns the runtime TLS
+library banner (C<OpenSSL 3.0.13 30 Jan 2024>, C<LibreSSL 3.8.2>), or
+undef when TLS support was not built. The two stacks agree on the API but
+not on behaviour - LibreSSL performs no TLS 1.3 session resumption, for
+one - and this is how a deployment (or a test) tells them apart.
+
+B<h2c Upgrade.> With C<< http2 => 1 >> over cleartext, an HTTP/1.1 request
+carrying C<Upgrade: h2c> is answered with C<101 Switching Protocols> and the
+connection continues as HTTP/2 (the original request becomes stream 1) - as
+well as the prior-knowledge preface. Over TLS, h2 is chosen by ALPN instead.
+
+C<max_requests_per_worker> counts every request the worker finishes,
+whatever protocol carried it, and retires it once the count reaches N: the
+replacement is forked from the supervisor, the retired worker drains what it
+is holding and exits, and a visitor sees nothing. It bounds what a worker can
+accumulate, which is the use it is usually put to, but it is a bound on
+requests and not on memory - a worker whose growth is per connection rather
+than per request reaches the bound late or not at all. It needs a pool:
+with C<< workers => 1 >> there is nothing to retire the worker into.
+
+With C<< workers > 1 >> a supervisor process manages the pool: a crashed
+worker is respawned (exponential backoff on crash loops; clean exits respawn
+immediately), C<SIGHUP> or C<SIGUSR2> recycles all workers with zero
+downtime (new workers start, old ones drain gracefully), C<SIGUSR1> makes
+every worker dump its stats to stderr, and C<SIGTERM> / C<SIGINT> drain -
+bounded by C<shutdown_grace> - and exit. With C<< workers => 1 >> the server
+runs in the calling process, no supervisor.
+
+The supervisor uses C<SIGALRM> as its own clock, and carries an C<alarm> that
+was already pending when C<run> was called: at that deadline the pool is shut
+down and the process then dies of C<SIGALRM>, as it would have without a
+server. So a watchdog that sets C<alarm> before starting the server still
+gets what it asked for - the whole pool, not just the supervisor - to within
+a few seconds.
+
+=head2 timer / io_ready
+
+    my $f = Hyperman->timer($secs);          # Future, resolves after $secs
+    my $g = Hyperman->io_ready($fh, 'r');    # Future, resolves on readiness
+
+Both require a running worker loop. C<< Hyperman->loop >> returns the current
+worker's L<Hyperman::Loop> (or undef outside one).
+
+=head2 tls_reload
+
+    my $n = Hyperman->tls_reload(\%sni);   # listeners rebuilt
+
+Replace this worker's TLS certificates without replacing the process.
+
+A listener's C<SSL_CTX> is built once, in the parent, before the fork -
+so a certificate issued while the server is running is not served, and
+C<SIGHUP> does not help because it re-forks from that same parent. This
+is the way to pick one up. C<%sni> is the same shape C<run> takes,
+C<< { host => { cert => $path, key => $path } } >>, and replaces the map
+entirely rather than merging into it.
+
+Call it B<from inside a worker> - from the app, or from a timer on
+C<< Hyperman->loop >>. Each worker holds its own context pointer (the
+fork copied it), so a reload changes that worker and no other; a pool
+picks the new certificate up as each worker calls it. The listening
+socket is never touched, so nothing is unbound and no connection is
+refused, and connections already handshook keep the one they have. The
+next connection B<that worker> accepts uses the new certificate.
+
+Returns the number of listeners rebuilt: 0 outside a worker, 0 on a
+plain-only server, and 0 when the rebuild would have served less than
+what is already running - either because the default certificate would
+not load, or because a per-host one would not and that host would have
+silently dropped to the fallback. In every one of those cases the
+running certificates are left exactly as they were, and the reason is
+printed to C<STDERR>.
+
+A worker respawned after a crash, or recycled by C<SIGHUP>, inherits the
+parent's boot-time context again and needs its own C<tls_reload>. That
+is a feature of where the context is built, not a bug here: whatever
+drives the reload should drive it per worker rather than once.
+
+=head2 stats
+
+    my $s = Hyperman->stats;   # in-app, inside a worker
+    # { requests => N, accepts => N, denied => N, bytes_out => N,
+    #   connections => N, backend => 'kqueue', pid => $$ }
+
+Per-worker counters; returns undef outside a running loop. C<denied> counts
+connections dropped at accept by the denylist (see below).
+
+=head2 detach
+
+    my $fd = Hyperman::detach($env);
+
+Hand a live HTTP/1 connection to the application. The server removes its
+watchers for the socket, forgets the connection and B<does not close it>,
+so from that point the application's own C<psgix.loop> watchers on that
+descriptor are what drive it. This is the seam a protocol upgrade needs:
+before it, a hijacked socket raced the server's own read watcher, which
+consumed post-upgrade bytes into a buffer nothing drained.
+
+The application writes its own upgrade response - the server's writer is
+out of the picture - and returns C<[101, [], []]>, which is discarded.
+Returns the real file descriptor.
+
+    my $conn = $env->{'psgix.hyperman.conn'};   # [ fd, generation id ]
+
+C<psgix.hyperman.conn> is both the ticket detach works from and the way an
+application detects that detaching is possible at all: it is absent on
+HTTP/2 and on servers that are not Hyperman. Detaching croaks, with the
+reason, when the connection is gone or the ticket is stale, on HTTP/2, on
+TLS, when output is still queued, or when it has already been detached.
+
+Detach is legal from a Future continuation - asynchronous authentication
+before an upgrade - but not from a C<psgi.streaming> responder, which has
+already begun a response, nor once response bytes are queued.
+
+The equivalent for a C consumer is the table's C<conn_detach>.
+
+=head2 stream
+
+    my $w = Hyperman::stream($env, 200, [ 'Content-Type' => 'text/plain' ]);
+    $w->write($chunk);
+    $w->close;
+
+Begin a streamed response body on this request and return a
+L<Hyperman::Writer> for it. Unlike L</detach> it works on B<HTTP/2>, where
+it writes one stream of many rather than taking the socket, and on B<TLS>,
+where there is no descriptor to hand over at all. The application does not
+say which: the transport branch is inside the handle.
+
+    my $tick = $env->{'psgix.hyperman.stream'};
+    # [ fd, generation id, stream id ]  - stream id is -1 on HTTP/1.1
+
+C<psgix.hyperman.stream> is the ticket, and is present on both transports.
+It is a separate key from C<psgix.hyperman.conn>, which names a descriptor
+an application may take over and which HTTP/2 has nothing to put behind.
+
+The response must already be B<deferred> - a C<psgi.streaming> coderef, or a
+handler parked on a Future. A synchronous handler's return value is still
+coming and would be serialised on top of the body being streamed, so
+streaming from one croaks rather than corrupting the response.
+
+    sub {
+        my $env = shift;
+        return sub {                    # the responder is not needed
+            my $w = Hyperman::stream($env, 200, \@headers);
+            $w->write($_) for @chunks;
+            $w->close;
+        };
+    }
+
+C<< ->close >> ends the body; a writer that goes out of scope unclosed ends
+it too. Writing to a stream whose connection has gone is silently dropped
+rather than fatal - the C door returns the reason, and a Perl producer that
+needs to know has already lost the reader.
+
+On HTTP/1.1 a streamed body is sent chunked and the connection is kept for
+its next request, exactly as a C<psgi.streaming> responder's is. A
+C<Content-Length> in the headers is honoured instead, and an HTTP/1.0 client,
+a request that asked for C<Connection: close>, or a 101 upgrade gets an
+EOF-delimited body and a close, as before 0.57.
+
+The equivalent for a C consumer is the table's C<stream_open>; see
+L</Stream handles>.
+
+=head2 Denylist and rate limiting
+
+Hyperman creates a L<Shared::Arena> B<before it forks its workers> (see
+L</arena>) and keeps an IP denylist and a set of fixed-window rate counters
+on two maps in it. They are shared, not per-worker, on purpose: a counter
+kept per worker would let a C<100/min> limit through at C<workers x 100/min>,
+and a denylist kept per worker would be a different list on each. Because the
+mapping is inherited across the fork, every worker reads and writes the one
+copy, and C<< Hyperman->arena->map('deny') >> and C<map('rate')> are those
+very maps.
+
+The B<denylist> is enforced at C<accept>: a blocked peer's connection is
+closed before a connection object is built or a byte is read - the cheapest
+possible rejection - and the worker's C<denied> stat counts it. Seed it
+statically with C<< run(deny => ['1.2.3.4', ...]) >>; C<deny_capacity> and
+C<rate_capacity> size the two tables (both default, and both round-trip a few
+thousand entries).
+
+The B<rate counters> are a fixed window: at most C<limit> hits against a key
+in each C<window>-second wall-clock slot. The first hit of a slot creates the
+counter with a deadline at the slot's end, every later hit counts against
+that same deadline, and the first hit after it starts the next slot at one -
+no timer, no sweep, and the window never slides. A lapsed counter's slot is
+reclaimed the next time anything lands on it, so when the keys that filled
+the table go quiet their slots are reused on demand rather than lingering.
+Size C<rate_capacity> above the peak of distinct keys in a window: over
+capacity the map refuses the new key and the request is allowed, which leaks
+looser, never tighter, and disturbs no live counter. N gateways behind a load
+balancer admit up to N times the limit, which is honest rather than a
+distributed count this does not implement.
+
+An XS module reaches all of this through the C ABI below - C<deny_check> /
+C<deny_add> / C<deny_remove> and C<ratelimit_hit> - which is how L<Punk>'s
+C<rate_limit> keyword and C<< $c->block_ip >> are built, with no Perl on the
+hot path. The same four are also plain class methods, for an application that
+is not an XS module:
+
+    Hyperman->deny_add($ip, $ttl_seconds);   # 0 = until the server stops
+    Hyperman->deny_remove($ip);
+    my $blocked = Hyperman->deny_check($ip);
+
+    my ($allowed, $remaining, $reset)
+        = Hyperman->ratelimit_hit($key, $limit, $window);
+
+C<ratelimit_hit> counts one hit against C<$key> in the current window and says
+whether it is within C<$limit>; C<$reset> is the epoch second the window
+rolls, which is what an C<X-RateLimit-Reset> header wants. A C<$limit> of 0 is
+unlimited and reports a C<$remaining> of -1. C<$window> defaults to 60.
+
+Reach for these rather than a Perl equivalent, because a Perl equivalent is
+wrong in a way that is hard to see: a hash in the worker gives a B<different
+denylist per worker>, and a counter in the worker turns a limit of C<$n> into
+C<workers x $n>. The arena is the one copy all of them share.
+
+All four fail B<open> when there is no arena - outside a running server, or
+when L<Shared::Arena> is absent or refuses to create one - so nothing is
+denied and nothing is limited. That is the same answer the accept path gives itself, and the safe
+one for a check that could not run. Note that a denylist entry added from
+inside a request is enforced at C<accept> from then on, so it takes effect on
+the B<next> connection, not the one that added it.
+
+=head2 The message bus
+
+    # anywhere: a request handler, a timer, another worker
+    Hyperman->publish('room:lobby', $bytes);
+
+    # in a worker, usually from on_worker_start
+    Hyperman->subscribe('room:lobby' => sub {
+        my ($topic, $payload) = @_;
+        $_->send($payload) for $room->clients;
+    });
+
+A publish/subscribe bus across the whole worker pool, on a
+L<Shared::Arena::Ring> in the server's arena (see L</arena>) beside the
+denylist and the rate counters. No Redis, no hub process. C<bus_groups> is
+accepted for compatibility and ignored: the ring's group table holds 64.
+
+It exists because a prefork server makes anything held in a worker a lie
+about the pool. L<Punk::WebSocket::Room> says so in its own documentation: a
+room is per worker, so under C<< workers => 4 >> a broadcast reaches roughly a
+quarter of the people in it, the call succeeds, and nobody is told. The same
+shape applies to Server-Sent Events, to cache invalidation, and to anything
+else one worker learns and the others need.
+
+=head3 Two delivery modes, and where the cursor lives
+
+A message is published once. The whole difference is B<where the cursor
+lives>:
+
+=over 4
+
+=item * B<Fanout> - the default. Each subscriber keeps its cursor in its own
+process, so B<every> subscriber sees B<every> message. This is what a chat
+room wants.
+
+=item * B<A queue group> - C<< group => $name >>. One cursor lives in the
+arena and is advanced with an atomic compare-and-swap, so B<exactly one>
+member of the pool sees each message. This is load-balanced work
+distribution.
+
+=back
+
+The balancing is not implemented, it is a consequence. A worker that is busy
+is not in the claim, so it does not take anything, so the free workers take
+the traffic. There is no scheduler and nothing to tune.
+
+Both may be live on the same topic at once: a room can fan out to every
+worker's connections while a group of workers takes one copy each to write to
+a log. A group consumes only its own cursor, so the fanout readers still see
+everything.
+
+=head3 Which to use, and when NOT to use this at all
+
+B<Delivery is at-most-once.> A worker that claims a message and then dies
+loses it, and the loss is counted rather than retried. Nothing survives a
+restart: the ring is memory, and memory is what makes it fast.
+
+If losing the message matters, this is the wrong tool. L<Punk::Queue> is the
+right one.
+
+    .                     Punk::Queue        a bus queue group
+    delivery              at-least-once      at-most-once
+    survives a restart    yes                no
+    worker dies mid-work  retried            counted, and lost
+    latency               milliseconds       microseconds
+    storage               Postgres/SQLite    shared memory
+
+Sending an email, charging a card, resizing an upload somebody paid for: the
+queue. Telling the other workers a cache key changed, fanning a chat message
+out, nudging every worker to re-read a config: the bus.
+
+=head3 Overflow: bounded, drop-oldest, counted
+
+The ring is fixed. When a reader falls far enough behind, the ring wraps past
+what it has not read yet, and those messages are gone.
+
+Every part of that is deliberate. B<Bounded>, because an unbounded buffer in
+front of a stalled worker is a memory leak with a schedule - one wedged
+consumer would grow it until the server dies and takes the healthy workers
+with it. B<Drop-oldest>, because when a system is in trouble the recent
+messages are the ones anybody wants. B<Counted>, and the count reachable,
+because a silently short chat room is indistinguishable from a quiet one.
+
+    my %s = Hyperman->bus_stats('thumbs');
+    warn "bus dropped $s{gaps}"       if $s{gaps};
+    warn "group lost $s{group_gaps}"  if $s{group_gaps};
+
+A climbing count means the reader is too slow or C<bus_slots> is too small. In
+measurement, nothing is lost until a publisher is running at over a million
+messages a second - far past a rate any consumer can be scheduled at, which is
+exactly when dropping the oldest is the right answer.
+
+The ring B<cannot> grow to fit, and would not if it could. It is a shared
+mapping inherited by every worker at a fixed address and size, so growing it
+would mean every already-forked process mapping new pages in step, which there
+is no mechanism to do. Size it with C<bus_slots> instead.
+
+=head3 The wakeup
+
+A publish pokes every other worker through a descriptor it has been watching
+since it started, so the message arrives in microseconds rather than whenever
+that worker next happens to look. Measured publish-to-wake across processes is
+under a fifth of a millisecond.
+
+A burst does not become a storm: a worker with a poke already in flight is not
+poked again, so a thousand publishes in a loop produce a single wakeup rather
+than a thousand.
+
+=head3 Methods
+
+=over 4
+
+=item C<< Hyperman->publish($topic, $payload) >>
+
+C<1> on the ring, C<0> local-only (there is no arena, so nobody else will see
+it), C<-1> refused as too big for a slot. Three outcomes rather than true or
+false, because "sent to the pool" and "sent to myself" are different facts and
+a caller that cannot tell them apart cannot diagnose anything.
+
+An oversize message is refused, never truncated: a truncated WebSocket frame
+is a protocol violation delivered to every member of a room.
+
+=item C<< Hyperman->subscribe($topic, $cb, group => $name) >>
+
+Returns an id, or C<-1>. The callback is invoked as C<< $cb->($topic,
+$payload) >> from this worker's event loop. C<group> is the only difference
+between the two delivery modes.
+
+A subscriber that dies has its death turned into a warning. It runs from the
+event loop with nothing to unwind into, and one bad handler must not remove a
+worker from the pool.
+
+=item C<< Hyperman->unsubscribe($id) >>
+
+=item C<< Hyperman->receive >>
+
+Everything published since this process last asked, as C<< [$topic,
+$payload] >> pairs. The manual alternative to C<subscribe>, for a process that
+is not on a Hyperman loop.
+
+=item C<< Hyperman->claim($topic, $group) >>
+
+The same, load-balanced. C<$group> defaults to the topic.
+
+B<A subscription begins at "from now on".> Both a C<subscribe> and the first
+C<claim> on a group start at the current position, not at the oldest message
+still in the ring - so register before publishing, and expect nothing back
+from a claim on a group that did not exist when the message was sent.
+
+That is deliberate. The alternative is that a worker restarting at three in
+the morning replays every message still in the ring, all at once, to a process
+that has just come up - which is the moment it can least afford it.
+
+=item C<< Hyperman->dispatch >>
+
+Runs the subscriptions by hand and returns how many messages reached a
+subscriber. Under a worker the wakeup does this; outside one, this is the poll
+that stands in for it.
+
+=item C<< Hyperman->bus_reset >>
+
+Point this process's cursor at "from now on". A worker does this for itself;
+a process that forks by hand must, or the child replays what the parent
+already handled.
+
+=item C<< Hyperman->bus_stats($group) >>
+
+C<published>, C<gaps>, and C<group_gaps> when a group is named.
+
+C<gaps> is what this PROCESS missed - messages the ring wrapped past before
+it read them - counted across both of its readers, C<receive> and the
+dispatcher behind C<subscribe>. Nothing calls C<receive> under a server, so a
+count of only that one would read zero however much a busy worker's
+subscriptions dropped.
+
+=item C<< Hyperman->bus_live >>
+
+Whether there is a shared ring at all.
+
+=back
+
+Topics match B<exactly>. A hierarchy is a naming convention - C<room:lobby>,
+C<room:support> - dispatched by the caller, since C<receive> hands back the
+topic with every message.
+
+=head3 Where it is not there
+
+Local-only on Windows, and on a compiler without the atomics the arena needs.
+C<publish> returns C<0> and reaches this process's own subscribers; a queue
+group degrades to "this process is the only member", which is correct rather
+than convenient. That is the same answer C<deny_check> and C<ratelimit_hit>
+give, and it is the tested path rather than a fallback nobody exercises.
+
+=head2 on_worker_start
+
+    Hyperman->on_worker_start(sub {
+        $dbh = DBI->connect(...);          # this child's own handle
+        srand;                             # this child's own seed
+    });
+
+    Hyperman->run(app => $app, workers => 4);
+
+Registers a callback that runs once in every worker, B<after the fork> and
+before that worker's loop starts turning. Register before C<run>: the registry
+is read in the child, so a callback added afterwards will never reach the
+workers already running.
+
+A prefork server needs this and PSGI has no standard for it. Anything holding
+a file descriptor - a database handle, a cache connection - is wrong in a
+child that inherited it from the parent, and sharing one across workers
+corrupts it in ways that look like anything but the cause.
+
+Returns 1, or 0 when the table is full (8 callbacks). Croaks on a non-coderef,
+at registration. If the callback dies the death becomes a warning and the
+worker carries on serving: a worker that could not run your setup code is
+still a worker, and one that never starts is an outage - so check what you
+depend on rather than assuming it ran.
+
+The C ABI's C<on_worker_start> is the same registry, for a consumer that would
+rather register a C function than a coderef.
+
+=head2 arena
+
+    my $arena = Hyperman->arena;          # a Shared::Arena, or undef
+
+    Hyperman->arena->lease('cron');       # every tenant, in the server's region
+    Hyperman->arena->hll('visitors');
+    Hyperman->arena->map('sessions', slots => 4096, slot_size => 512);
+
+The L<Shared::Arena> the server created before it forked its workers: one
+region every worker maps, with L<Shared::Arena>'s tenants all available on it.
+A structure a worker opens here is the same structure in every other worker,
+which is what a lease, a distinct count or a shared map is for.
+
+C<undef> before C<run>, and when L<Shared::Arena> could not be loaded or is
+older than this Hyperman was built against, in which case the server runs
+without one and everything that would use it fails open.
+
+C<< run(arena_name => $name) >> gives the region a name, so another process
+can C<< Shared::Arena->attach($name) >> to it and a restarted server attaches
+to the region the previous one left rather than creating a fresh one. The
+default is anonymous: inherited across the fork, gone when the last worker
+exits. C<arena_size> overrides the size Hyperman computes from its own tables;
+a tenant that does not fit is refused by L<Shared::Arena> and warns at the
+point of use.
+
+=head2 Pool state
+
+    my @rows = Hyperman->pool_stats;         # one hashref per worker
+    my $sum  = Hyperman->stats(pool => 1);   # every row summed
+
+    my $lease = Hyperman->leader('cron', ttl => 30);
+    if ($lease->acquire) { ... this worker, and only this one ... }
+
+    my ($distinct, $err) = Hyperman->distinct_clients;   # run(distinct_clients => 1)
+
+What the arena makes possible, off the hot path. The rule for everything
+here is that B<nothing runs per request or per accept by default>.
+
+B<The scoreboard.> Every worker owns one row on a L<Shared::Arena::Scoreboard>
+in the server's arena and copies its own counters into it B<once a second,
+from a timer>: requests, accepts, denied, connections, bytes out, QUIC
+datagrams, HTTP/3 requests, and a status of C<idle> or C<busy N>. One
+seqlock bracket per worker per second, and nothing on the request path.
+C<pool_stats> reads every row coherently, from a worker, from the supervisor,
+or from a process that attached by C<arena_name>, which is what a C</status>
+endpoint or a C<punk doctor> wants; C<< stats(pool => 1) >> is the sum. A
+row's C<alive> is C<kill(pid, 0)>, which answers 1 for a process this user may
+not signal, whether it lives or not. C<USR1> to the supervisor now prints one
+aggregate line and one line per worker, a dead row marked C<DEAD>; the
+workers no longer print their own.
+
+The supervisor also looks at the board every three seconds. A worker whose
+pid answers but whose row has not moved for three looks is logged as
+B<wedged>: alive is not the same as serving, and a loop that has stopped
+turning is the one failure a pid check cannot see. The respawn policy is
+unchanged; the log line is the deliverable.
+
+B<The leader.> C<leader($name, ttl => $secs)> is C<< Hyperman->arena->lease >>,
+a L<Shared::Arena::Lease>: exactly one process in the pool holds it at a time,
+and when the holder dies or fails to renew before the ttl a successor takes
+over. This is what a cron plugin or a queue scheduler needs, and the thing to
+read first is B<the fencing token>. A leader that is paused - a stop-the-world
+pause, a swap storm, a debugger - does not know it has lost the lease until
+it wakes, and by then a successor may hold it and be working. Anything the
+leader writes must carry C<< $lease->fence >> and the resource must refuse a
+stale one; without that, two leaders write and the second overwrites the
+first. L<Shared::Arena::Lease> has the whole argument.
+
+B<Distinct clients.> C<< run(distinct_clients => 1) >> opens a
+L<Shared::Arena::HyperLogLog> at precision 14 and adds every accepted peer's
+B<address> to it, right after the denylist check: a client is an address, so
+a thousand connections from one host are one client. That is a hash and a
+CAS-max on the accept path, about 10 nanoseconds per connection (measured in
+C<BENCHMARKS.md>), which is why it is B<off by default>: this server promises
+the accept path costs nothing it was not asked for, and with the option off
+the branch is one load of a NULL. C<distinct_clients> returns the estimate
+and its relative error (about 0.8%), or the empty list when off. The sketch
+is 16KB, shared by the whole pool, and never resets on its own.
+
+=head1 C ABI
+
+Hyperman exposes a public C ABI so that B<other XS modules> can drive its
+event loop and futures entirely from C - fd watchers and timers whose
+callbacks run with no Perl call frame per event, and Hyperman::Future
+create/settle/inspect without method dispatch. The motivating consumer is
+L<DBIx::Loop>, whose pure-XS loop adapter watches database socket fds and
+settles futures on the worker loop C-to-C.
+
+=head2 Getting the header
+
+The contract lives in F<include/hyperman/hm_abi.h>. Two ways to reach it:
+
+B<ExtUtils::Depends> (no copying). Hyperman is a provider: building installs
+F<hm_abi.h> and writes C<Hyperman::Install::Files>, so a dependent's
+F<Makefile.PL> that says
+
+    my $pkg = ExtUtils::Depends->new('My::Consumer', 'Hyperman');
+    WriteMakefile( ..., $pkg->get_makefile_vars );
+
+picks up F<hm_abi.h> on its include path automatically - but makes Hyperman
+a configure-time dependency of the consumer.
+
+B<Vendoring a pinned copy>. Because the table is resolved at runtime and the
+header is pure declarations, a consumer that wants Hyperman to stay
+B<optional> (as DBIx::Loop does) instead ships its own copy of F<hm_abi.h>
+pinned at a known C<HM_ABI_VERSION> and simply fails its resolve when
+Hyperman is not loaded.
+
+Perl headers (F<EXTERN.h> / F<perl.h> / F<XSUB.h>) must be included before
+F<hm_abi.h>.
+
+=head2 The table
+
+    #define HM_ABI_VERSION 8
+
+    #define HM_ABI_READ  0x1        /* io_watch masks     */
+    #define HM_ABI_WRITE 0x2
+
+    #define HM_ABI_PENDING   0      /* future_state       */
+    #define HM_ABI_DONE      1
+    #define HM_ABI_FAILED    2
+    #define HM_ABI_CANCELLED 3
+
+    #define HM_ABI_STREAM_OK      0 /* stream_write, stream_close */
+    #define HM_ABI_STREAM_FULL    1
+    #define HM_ABI_STREAM_STALE  -1
+    #define HM_ABI_STREAM_GONE   -2
+    #define HM_ABI_STREAM_ARG    -3
+    #define HM_ABI_STREAM_HIWAT (256 * 1024)
+
+    typedef struct hm_abi_timer hm_abi_timer;    /* opaque handle */
+
+    typedef void (*hm_abi_io_cb)(pTHX_ int fd, int mask, void *ud);
+    typedef void (*hm_abi_timer_cb)(pTHX_ void *ud);
+    typedef void (*hm_abi_ready_cb)(pTHX_ SV *future, void *ud);
+    typedef void (*hm_abi_worker_cb)(pTHX_ void *loop, void *ud);
+    typedef void (*hm_abi_stream_cb)(pTHX_ void *h, void *ud);
+    typedef void (*hm_abi_stream_data_cb)(pTHX_ void *h, const char *buf,
+                                          STRLEN len, int fin, void *ud);
+
+    typedef struct hm_abi {
+        int abi_version;                          /* == HM_ABI_VERSION */
+
+        /* loop handles (opaque hm_loop*) */
+        void *(*cur_loop)(pTHX);
+        void *(*loop_of_sv)(pTHX_ SV *loop_sv);
+        SV   *(*sv_of_loop)(pTHX_ void *loop);
+
+        /* persistent fd watchers, pure C dispatch */
+        void (*io_watch)(pTHX_ void *loop, int fd, int mask,
+                         hm_abi_io_cb cb, void *ud);
+        void (*io_unwatch)(pTHX_ void *loop, int fd, int mask);
+
+        /* one-shot timer with cancellation */
+        hm_abi_timer *(*timer)(pTHX_ void *loop, double secs,
+                               hm_abi_timer_cb cb, void *ud);
+        void (*timer_cancel)(pTHX_ void *loop, hm_abi_timer *t);
+
+        /* Hyperman::Future */
+        SV  *(*future_new)(pTHX);
+        int  (*is_future)(pTHX_ SV *sv);
+        IV   (*future_state)(pTHX_ SV *f);
+        void (*future_done)(pTHX_ SV *f, SV **vals, SSize_t n);
+        void (*future_fail)(pTHX_ SV *f, SV *err);
+        void (*future_on_ready)(pTHX_ SV *f, hm_abi_ready_cb cb, void *ud);
+
+        /* await: pump the loop until f settles (re-entrant) */
+        void (*run_until)(pTHX_ void *loop, SV *f);
+
+        /* v2: detach a live HTTP/1 connection (see Hyperman::detach).
+         * 0 ok; -1 no such connection or a stale id; -2 HTTP/2; -3 TLS;
+         * -4 output still queued; -5 already detached. */
+        int (*conn_detach)(pTHX_ void *loop, int fd, UV id);
+
+        /* v3: abuse controls on the fork-shared arena (no pTHX, no SV;
+         * process-global; fail open with no arena). deny_check is the
+         * lock-free accept-path check; ratelimit_hit is a fixed window,
+         * returns 1 within the limit and 0 over, filling *remaining and
+         * *reset (the epoch the window rolls) when non-NULL. */
+        int  (*deny_check)(const char *ip);
+        void (*deny_add)(const char *ip, long ttl_secs);
+        void (*deny_remove)(const char *ip);
+        int  (*ratelimit_hit)(const void *key, STRLEN klen,
+                              IV limit, IV window, IV *remaining, IV *reset);
+
+        /* v4: run cb once in every worker, AFTER the fork, in the child,
+         * with that child's own loop, before the loop starts turning.
+         * Register before run(). Fires in the single-worker case too.
+         * Returns 1, or 0 when the table is full. */
+        int (*on_worker_start)(pTHX_ hm_abi_worker_cb cb, void *ud);
+
+        /* v5: the cross-worker message bus */
+        int (*bus_publish)(const char *topic, STRLEN tlen,
+                           const char *payload, STRLEN plen);
+        int (*bus_subscribe)(pTHX_ const char *topic, STRLEN tlen,
+                             const char *group, STRLEN glen,
+                             hm_abi_bus_cb cb, void *ud);
+        int (*bus_unsubscribe)(pTHX_ int id);
+
+        /* v6: stream handles. stream_open sends status + headers and
+         * returns an opaque handle, or NULL if the ticket names no live
+         * connection, a response has already gone out, or (HTTP/1.1) the
+         * handler has not deferred yet. (fd, id, stream_id) is the ticket
+         * published as psgix.hyperman.stream; stream_id is -1 on HTTP/1.1.
+         * headers is a PSGI header arrayref, not a byte string, so h2 can
+         * pass it to nghttp2 as nghttp2_nv[]. The caller owns the handle
+         * until stream_close, the only entry point that frees one. */
+        void *(*stream_open)(pTHX_ void *loop, int fd, UV id,
+                             int64_t stream_id, int status, SV *headers);
+        int   (*stream_write)(pTHX_ void *h, const char *buf, STRLEN len);
+        int   (*stream_close)(pTHX_ void *h);
+        int   (*stream_on_drain)(pTHX_ void *h, hm_abi_stream_cb cb, void *ud);
+        int   (*stream_on_abort)(pTHX_ void *h, hm_abi_stream_cb cb, void *ud);
+
+        /* v7: the other ending. Stops a body so the peer can tell it was
+         * not finished - RST_STREAM on h2 and h3, a connection reset on
+         * HTTP/1.1 - and releases the handle the way stream_close does.
+         * A producer calls one or the other, never both. */
+        int   (*stream_abort)(pTHX_ void *h);
+
+        /* v8: the read half, which makes a handle bidirectional. With a
+         * callback registered, request bytes on this stream go to it
+         * instead of into psgi.input - which is what a stream opened by
+         * Extended CONNECT needs, since it never ends and buffering it
+         * would grow without bound. NULL removes it. */
+        int   (*stream_on_data)(pTHX_ void *h, hm_abi_stream_data_cb cb,
+                                void *ud);
+    } hm_abi;
+
+C<on_worker_start> is the seam for anything a consumer owns that is bound to
+an event loop. A flush timer, a wakeup listener, a metrics reader: none of
+them can be created before C<run>, because the loop they would attach to is
+not the loop that ends up serving - a prefork server has forked by then, and
+on kqueue the child's copy of the descriptor is not even valid. This is the
+one moment where the loop exists, belongs to the process that will serve, and
+has not started turning.
+
+    static void on_worker(pTHX_ void *loop, void *ud) {
+        A->timer(aTHX_ loop, 5.0, flush, ud);      /* the child's own loop */
+    }
+    A->on_worker_start(aTHX_ on_worker, ud);       /* before run() */
+
+L</on_worker_start> is the same registry as a class method, for an
+application that wants to reopen a database handle rather than attach a
+watcher. A Perl callback is handed no loop - C<< Hyperman->loop >> is the
+worker's own once it is running - because the useful thing to do with the raw
+pointer is a C entry point.
+
+=head2 Stream handles
+
+C<conn_detach> hands over a file descriptor, and that is why it refuses
+HTTP/2 and TLS. Those refusals are correct rather than gaps: an HTTP/2
+stream is one of many on a shared connection, so no descriptor means "this
+stream", and a TLS session's state belongs to the server and not to the
+socket. The seam that works on every transport is a B<stream handle>, and
+the five v6 entries are it. L</stream> is the same registry as a Perl call.
+
+    void *h = A->stream_open(aTHX_ loop, fd, id, sid, 200, headers);
+    A->stream_on_abort(aTHX_ h, on_abort, ud);
+    A->stream_on_drain(aTHX_ h, on_drain, ud);
+    if (A->stream_write(aTHX_ h, buf, len) == HM_ABI_STREAM_FULL)
+        return;                     /* resume from on_drain */
+    A->stream_close(aTHX_ h);
+
+The handle carries its own generation guard and every entry point checks it
+against the live registry before dereferencing it, so a write arriving after
+the connection died is C<HM_ABI_STREAM_GONE> and never a read of freed
+memory. Nothing but C<stream_close> frees a handle: a connection that goes
+away only marks its handles dead and fires their abort callbacks, and an
+aborted stream still has to be closed.
+
+C<stream_on_abort> is what makes this better than detach rather than merely
+equivalent. A multiplexed peer can reset one stream out of many - an HTTP/2
+C<RST_STREAM> - and the producer has to hear about it and stop; HTTP/1.1 has
+no analogue, where the whole connection simply dies. Registering it on a
+stream that is already dead fires it immediately, the same contract
+C<future_on_ready> has on a settled future, so the wakeup cannot be lost to
+a race.
+
+C<stream_on_data> (v8) is the read half, and it is what makes a handle
+B<bidirectional>. Everything else here writes, which is the whole of an
+ordinary response; a stream opened by L</Extended CONNECT (WebSocket over
+HTTP/2 and HTTP/3)> carries traffic both ways. With a callback registered,
+request bytes on that stream go to it instead of into C<psgi.input>.
+
+C<stream_on_drain> is backpressure. C<stream_write> answers
+C<HM_ABI_STREAM_FULL> once the connection is holding more than
+C<HM_ABI_STREAM_HIWAT> unwritten bytes: the bytes were taken, but a
+well-behaved producer stops there and resumes when the drain callback fires.
+
+Like every other callback in the table, neither may croak.
+
+=head2 Hyperman::_abi_ptr
+
+    my $iv = Hyperman::_abi_ptr;
+
+Returns the address of the process-wide C<hm_abi> table as an integer (an
+C<IV>). A consumer calls this once (at C<BOOT>, or lazily on first use),
+C<INT2PTR>s it to a C<< const hm_abi * >>, and checks
+C<< ->abi_version >= HM_ABI_VERSION >> (the version it was compiled
+against) before using it. Not intended to be called from Perl for any other
+purpose. C<Hyperman::_abi_selftest> exercises the whole table from C and
+returns 1; it exists for Hyperman's own test suite.
+
+=head2 Loop handles
+
+C<cur_loop> returns the currently running loop or C<NULL> - inside a
+Hyperman worker it is the worker's loop, so a consumer resolving at request
+time needs no loop object at all. C<loop_of_sv> unwraps a L<Hyperman::Loop>
+SV (croaks on anything else); C<sv_of_loop> returns the loop's blessed
+wrapper SV (+1, caller owns), the same shared wrapper C<psgix.loop> uses.
+The handle is opaque; pass it back to every loop-taking entry.
+
+=head2 Watchers and timers
+
+C<io_watch> installs a B<persistent> C watcher for one direction of one fd
+(C<HM_ABI_READ> or C<HM_ABI_WRITE> - one direction per call). The callback
+fires on every readiness event with no Perl call frame, receiving the fd,
+the direction that fired, and C<ud>. Installing replaces any existing
+watcher (C, Perl callback, or future) for that fd+direction; C<io_unwatch>
+is idempotent and safe from inside the callback. fd must be below
+Hyperman's fd ceiling (65536); a bad fd croaks.
+
+C<timer> arms a B<one-shot> timer and returns an opaque handle;
+C<timer_cancel> disarms a timer that has not fired yet. The handle dies
+when the callback fires - never cancel after the fire (clear any stored
+handle inside the callback). Cancel live timers before dropping a loop.
+
+=head2 Futures
+
+C<future_new> returns a pending L<Hyperman::Future> (+1, caller owns).
+C<future_done> / C<future_fail> settle it and run its continuations through
+the normal trampoline; both are no-ops on an already-settled future, and
+values are copied, not stolen. C<future_state> returns the C<HM_ABI_*>
+state without dispatch. C<future_on_ready> attaches a C continuation that
+fires exactly once when the future settles - B<including cancellation>
+(check C<future_state> to see which); this is how a consumer hooks
+cancellation, e.g. issuing a database cancel when a caller cancels the
+future. It fires immediately if the future is already settled.
+
+C<run_until> pumps the loop until the given future settles. It is
+re-entrant - calling it from inside a callback nests, exactly like
+C<< ->get >> inside a Hyperman worker - so a blocking-style C<await> can be
+built on it directly.
+
+=head2 The message bus (v5)
+
+    static void on_msg(pTHX_ const char *topic, STRLEN tl,
+                       const char *payload, STRLEN pl, void *ud) { ... }
+
+    A->bus_subscribe(aTHX_ "room:lobby", 10, NULL, 0, on_msg, ud);
+    A->bus_publish("room:lobby", 10, bytes, len);
+
+The C door onto L</The message bus>, so a consumer can fan a message across
+the worker pool without a Perl frame on either side.
+
+C<group> C<NULL> is fanout - this process sees every message on the topic. A
+group name makes it a queue group - exactly one member of the pool sees each
+message. One entry point, because they are one mechanism.
+
+C<bus_publish> returns 1 on the ring, 0 local-only (no arena), -1 refused as
+oversize. Like the v3 abuse controls it takes no C<pTHX>: the arena is
+process-global and the publish path touches no SV. The ceiling is
+C<bus_slot_size - 16> bytes of topic and payload together, the same number
+the old ring's slot header left, and a message over it is refused before the
+ring sees it; the ring itself could carry more, and a caller sizing against
+this bus must not rely on that.
+
+The callback is subject to the same contract as every other in this table and
+one that matters more here: B<it must not croak>. It is reached from the event
+loop with no Perl frame to unwind into, so a death would take the worker down
+- and for a chat server that means one bad handler silently removing a worker
+from the pool.
+
+Delivery is at-most-once and drops oldest under pressure, counting what it
+dropped. A consumer that cannot lose the message wants L<Punk::Queue>.
+
+=head2 Abuse controls (v3)
+
+The v3 entries reach the fork-shared arena described under L</Denylist and
+rate limiting>. They take no C<pTHX> and touch no SV - they operate only on
+that process-global arena - so a consumer may call them from any worker, and
+they B<fail open> when no arena is mapped.
+
+C<deny_check($ip)> returns 1 if C<$ip> (an C<INET6_ADDRSTRLEN> string) is
+denylisted and unexpired, else 0; it is lock-free, being the check Hyperman
+itself runs on every accept. C<deny_add($ip, $ttl_secs)> adds or refreshes an
+entry (C<$ttl_secs> 0 = permanent); C<deny_remove($ip)> lifts one.
+
+C<ratelimit_hit(key, klen, limit, window, &remaining, &reset)> counts one hit
+against the opaque C<key> (C<klen> bytes) under C<limit> per C<window>
+seconds, returning 1 within the limit and 0 over, and filling C<*remaining>
+(never below zero) and C<*reset> (the epoch the window rolls) when they are
+non-NULL. A C<limit> of 0 or less is unlimited. The window is fixed and a
+function of the clock, exactly as the arena describes.
+
+L<Punk> builds its C<rate_limit> keyword, C<< $c->block_ip >> and
+C<< $c->rate_hit >> on these four.
+
+The same four are class methods for a consumer that is not an XS module - see
+L</Denylist and rate limiting>. They are the same arena and interchangeable
+with these; what differs is a Perl call per invocation instead of none, which
+is why the framework-level keywords are built on the C entries.
+
+=head2 Contracts
+
+Everything is single-threaded and fires on the loop thread, inside the
+loop's dispatch:
+
+=over 4
+
+=item * C callbacks must B<not croak>. Trap errors (C<G_EVAL> around any
+Perl you call) and settle a future instead; a longjmp out of the dispatch
+loop leaves it inconsistent.
+
+=item * C<ud> lifetime is the consumer's problem: it must stay valid until
+the watcher is removed, the timer fires or is cancelled, or C<on_ready>
+fires. Remove watchers before freeing their C<ud>.
+
+=item * Callbacks may re-enter the table freely, including C<run_until>.
+
+=item * The table only ever grows at the end. C<HM_ABI_VERSION> bumps on
+any append; a consumer requires C<< abi_version >= >> the version it was
+written against.
+
+=back
+
+=head2 Example: resolve and use
+
+    #include "hm_abi.h"     /* via ExtUtils::Depends, or a vendored copy */
+
+    static const hm_abi *HM = NULL;   /* resolved on first use */
+
+    static const hm_abi *my_hm(pTHX) {
+        if (!HM) {
+            dSP; int n;
+            ENTER; SAVETMPS; PUSHMARK(SP); PUTBACK;
+            n = call_pv("Hyperman::_abi_ptr", G_SCALAR | G_EVAL);
+            SPAGAIN;
+            if (!SvTRUE(ERRSV) && n > 0) {
+                IV p = POPi;
+                if (p) {
+                    const hm_abi *a = INT2PTR(const hm_abi *, p);
+                    if (a->abi_version >= HM_ABI_VERSION) HM = a;
+                }
+            } else if (n > 0) (void)POPs;
+            PUTBACK; FREETMPS; LEAVE;
+        }
+        return HM;   /* NULL => Hyperman absent or too old: fall back */
+    }
+
+    /* watch a DB socket; on readable, collect the result and settle */
+    static void on_db_readable(pTHX_ int fd, int mask, void *ud) {
+        my_req *r = (my_req *)ud;            /* must not croak */
+        if (collect_result(r) == DONE) {
+            HM->io_unwatch(aTHX_ r->loop, fd, HM_ABI_READ);
+            if (r->timeout) {
+                HM->timer_cancel(aTHX_ r->loop, r->timeout);
+                r->timeout = NULL;
+            }
+            HM->future_done(aTHX_ r->future, &r->result_sv, 1);
+        }
+    }
+
+    /* fire a query: future + fd watch + timeout, all C */
+    void *loop = HM->cur_loop(aTHX);         /* the worker's loop */
+    r->future  = HM->future_new(aTHX);
+    HM->io_watch(aTHX_ loop, db_fd, HM_ABI_READ, on_db_readable, r);
+    r->timeout = HM->timer(aTHX_ loop, 5.0, on_db_timeout, r);
+    HM->future_on_ready(aTHX_ r->future, on_settled_or_cancelled, r);
+
+=head1 AUTHOR
+
+LNATION C<< <email@lnation.org> >>
+
+=head1 LICENSE AND COPYRIGHT
+
+This software is Copyright (c) 2026 by LNATION.
+
+This is free software, licensed under the Artistic License 2.0.
+
+=cut

@@ -1,0 +1,840 @@
+#!perl
+use strict;
+use warnings;
+use lib "t/lib";
+use Test::More;
+use HMTest qw(free_ports quiet_child server_reap);
+use IO::Socket::INET;
+use Socket qw(PF_INET SOCK_STREAM SOL_SOCKET SO_RCVBUF
+              inet_aton pack_sockaddr_in);
+use Time::HiRes ();
+use Errno ();
+use Hyperman;
+
+# ABI v6 stream handles (include/hyperman/hm_abi.h, include/hyperman/hm_stream.h).
+#
+# The claim being tested is that ONE C seam writes a streaming body over
+# HTTP/1.1 and over HTTP/2 without the caller naming the transport. So the
+# application below never branches on the protocol: every path calls the same
+# four table entries, and the test drives it once over each.
+#
+# Everything C-side goes through Hyperman::_abi_stream_* (xs/abi.xs), which
+# resolves the function-pointer table and calls through it. A Perl test cannot
+# register a C callback, so the abort and drain callbacks report into counters
+# that a LATER request reads back out - the same shape t/33-worker-start.t
+# uses for on_worker_start.
+
+my ($port) = free_ports(1);
+plan skip_all => "no free loopback port" unless $port;
+
+my $h2 = Hyperman->has_http2 ? 1 : 0;
+
+my $pid = fork;
+die "fork: $!" unless defined $pid;
+if ($pid == 0) {
+    quiet_child();
+    require Hyperman;
+    Hyperman->run(
+        app => sub {
+            my $env = shift;
+            my $p   = $env->{PATH_INFO};
+
+            # The C seam, from a deferred response. The responder handed in
+            # here is deliberately ignored: the point is that the body is
+            # produced by the ABI and not by psgi.streaming.
+            if ($p eq '/c-stream') {
+                return sub {
+                    Hyperman::_abi_stream_open($env, 200,
+                        [ 'Content-Type' => 'text/plain' ]) or return;
+                    Hyperman::_abi_stream_write("chunk$_;") for 1 .. 3;
+                    Hyperman::_abi_stream_close();
+                };
+            }
+
+            # More than one DATA frame, closed while most of it is still
+            # buffered: the close must not end the body at the next frame.
+            if ($p eq '/c-big') {
+                return sub {
+                    Hyperman::_abi_stream_open($env, 200,
+                        [ 'Content-Type' => 'text/plain' ]) or return;
+                    Hyperman::_abi_stream_write('x' x 100_000);
+                    Hyperman::_abi_stream_write('end');
+                    Hyperman::_abi_stream_close();
+                };
+            }
+
+            # Open, write once, and leave it open. Whatever kills the stream
+            # next - the client hanging up, an h2 RST_STREAM - is what the
+            # abort callback is there to catch.
+            if ($p eq '/c-stream-hold') {
+                return sub {
+                    Hyperman::_abi_stream_open($env, 200,
+                        [ 'Content-Type' => 'text/plain' ]) or return;
+                    Hyperman::_abi_stream_write("hold;");
+                };
+            }
+
+            # A producer that fails part way. The body it managed is not a
+            # whole response, and a clean close would present it as one - so
+            # this ends the other way, and the point of the test is that the
+            # client can tell the difference.
+            if ($p eq '/c-stream-abort') {
+                return sub {
+                    Hyperman::_abi_stream_open($env, 200,
+                        [ 'Content-Type' => 'text/plain' ]) or return;
+                    Hyperman::_abi_stream_write("partial;");
+                    Hyperman::_abi_stream_abort();
+                };
+            }
+
+            # 2048 chunks of 4KiB. Far more than the high-water mark, so the
+            # producer is told to stop and has to resume from on_drain - and
+            # more than a Linux send buffer autotunes to, so the kernel cannot
+            # take the whole body and leave nothing to pause on.
+            if ($p eq '/c-stream-big') {
+                return sub {
+                    Hyperman::_abi_stream_open($env, 200,
+                        [ 'Content-Type' => 'text/plain' ]) or return;
+                    Hyperman::_abi_stream_produce(2048);
+                };
+            }
+
+            # A handler that produces and then WAITS, inside the request,
+            # for the body to finish: a timer future's ->get pumps the
+            # worker's loop, which is how an application waits for a drain.
+            # Whether it finished while the handler was still waiting is
+            # recorded for /sync-result.
+            if ($p eq '/c-sync-wait') {
+                return sub {
+                    Hyperman::_abi_stream_open($env, 200,
+                        [ 'Content-Type' => 'text/plain' ]) or return;
+                    Hyperman::_abi_stream_produce(512);
+                    my $loop = Hyperman->loop;
+                    for (1 .. 150) {
+                        last unless (Hyperman::_abi_stream_state())[0];
+                        $loop->timer_f(0.02)->get;
+                    }
+                    $main::SYNC = (Hyperman::_abi_stream_state())[0]
+                                ? 'stuck' : 'done';
+                };
+            }
+            if ($p eq '/sync-result') {
+                return [ 200, [ 'Content-Type' => 'text/plain' ],
+                         [ $main::SYNC // 'none' ] ];
+            }
+
+            # The Perl door onto the same registry.
+            if ($p eq '/perl-stream') {
+                return sub {
+                    my $w = Hyperman::stream($env, 200,
+                                [ 'Content-Type' => 'text/plain' ]);
+                    $w->write("perl1;");
+                    $w->write("perl2");
+                    $w->close;
+                };
+            }
+
+            # Calling the Perl door from a synchronous handler is refused,
+            # because the handler's return value is still coming and would be
+            # written on top of the body.
+            if ($p eq '/perl-stream-sync') {
+                my $err = '';
+                eval { Hyperman::stream($env, 200, []); 1 } or $err = "$@";
+                $err =~ s/\s+\z//;
+                return [ 200, [ 'Content-Type' => 'text/plain' ], [$err] ];
+            }
+
+            # Write and close a handle whose stream died: an error return,
+            # not a crash.
+            if ($p eq '/late') {
+                my $w = Hyperman::_abi_stream_write("late");
+                my $c = Hyperman::_abi_stream_close();
+                return [ 200, [ 'Content-Type' => 'text/plain' ],
+                         ["write=$w close=$c"] ];
+            }
+
+            if ($p eq '/state') {
+                my @s = Hyperman::_abi_stream_state();
+                return [ 200, [ 'Content-Type' => 'text/plain' ],
+                         [ "open=$s[0] aborts=$s[1] drains=$s[2] "
+                         . "writes=$s[3] fulls=$s[4]" ] ];
+            }
+
+            # A 101 from a SYNCHRONOUS handler: the connection becomes a
+            # tunnel whose bytes belong to the handle both ways, and the
+            # triplet returned here is the sentinel the server discards.
+            # What a WebSocket over TLS needs, since detach refuses TLS.
+            if ($p eq '/tunnel') {
+                Hyperman::_abi_stream_open($env, 101,
+                    [ 'Upgrade' => 'echo', 'Connection' => 'Upgrade' ])
+                    or return [ 500, [ 'Content-Type' => 'text/plain' ],
+                                ['no tunnel'] ];
+                Hyperman::_abi_stream_read();
+                Hyperman::_abi_stream_write("hello;");
+                return [ 101, [], [] ];
+            }
+
+            # The same from a deferred response, which is the shape every
+            # other status already needs.
+            if ($p eq '/tunnel-deferred') {
+                return sub {
+                    Hyperman::_abi_stream_open($env, 101,
+                        [ 'Upgrade' => 'echo', 'Connection' => 'Upgrade' ])
+                        or return;
+                    Hyperman::_abi_stream_read();
+                    Hyperman::_abi_stream_write("deferred;");
+                };
+            }
+
+            if ($p eq '/tunnel-rx') {
+                my ($n, $len, $bytes) = Hyperman::_abi_stream_rx();
+                return [ 200, [ 'Content-Type' => 'text/plain' ], [$bytes] ];
+            }
+
+            if ($p eq '/tunnel-close') {
+                my $r = Hyperman::_abi_stream_close();
+                return [ 200, [ 'Content-Type' => 'text/plain' ], ["close=$r"] ];
+            }
+
+            return [ 200, [ 'Content-Type' => 'text/plain' ], ["ok:$p"] ];
+        },
+        host    => '127.0.0.1',
+        port    => $port,
+        workers => 1,
+        ($h2 ? (http2 => 1) : ()),
+    );
+    exit 0;
+}
+
+# ---- HTTP/1.1 helpers -----------------------------------------------------
+
+sub connect_h1 {
+    my $s;
+    for (1 .. 100) {
+        $s = IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => $port,
+                                   Proto => 'tcp');
+        last if $s;
+        Time::HiRes::sleep(0.05);
+    }
+    return $s;
+}
+
+# Send one request and read to EOF. The streamed responses here are
+# EOF-delimited (Connection: close), which is what hm_start_stream does.
+sub get_h1 {
+    my ($path) = @_;
+    my $s = connect_h1() or return;
+    syswrite $s, "GET $path HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+               . "Connection: close\r\n\r\n";
+    my $resp = '';
+    while (1) {
+        my $n = sysread $s, my $buf, 65536;
+        last if !defined $n || $n == 0;
+        $resp .= $buf;
+    }
+    close $s;
+    my ($head, $body) = split /\r\n\r\n/, $resp, 2;
+    return ($head, defined $body ? $body : '');
+}
+
+sub body_h1 { my (undef, $b) = get_h1(@_); return $b }
+
+# A client whose receive buffer is set SMALL, before connect so the window
+# scale is negotiated from it. Returns the socket and the buffer size the
+# kernel settled on. See the backpressure block below for why the size of the
+# client's window is what decides whether that test tests anything.
+sub connect_h1_window {
+    my ($want) = @_;
+    my $addr = pack_sockaddr_in($port, inet_aton('127.0.0.1'));
+    for (1 .. 100) {
+        socket(my $s, PF_INET, SOCK_STREAM, 0) or return;
+        setsockopt($s, SOL_SOCKET, SO_RCVBUF, pack('i', $want));
+        my $got = getsockopt($s, SOL_SOCKET, SO_RCVBUF);
+        $got = defined $got ? unpack('i', $got) : $want;
+        return ($s, $got) if connect($s, $addr);
+        close $s;
+        Time::HiRes::sleep(0.05);
+    }
+    return;
+}
+
+# ---- HTTP/1.1: the same seam, one transport -------------------------------
+
+my ($head, $body) = get_h1('/c-stream');
+like($head || '', qr{^HTTP/1\.1 200 }, 'HTTP/1.1: the C seam sent a 200');
+like($head || '', qr{Content-Type: text/plain}i,
+     'HTTP/1.1: the headers it was given went out');
+is($body, 'chunk1;chunk2;chunk3;',
+   'HTTP/1.1: three stream_write calls, in order, then stream_close');
+
+is(body_h1('/perl-stream'), 'perl1;perl2',
+   'HTTP/1.1: the Perl door writes the same body through the same registry');
+
+# Without Connection: close the same body is chunked and the connection is
+# kept: a second request on the socket is answered. Decoded by hand so the
+# framing itself is what is asserted.
+{
+    my $s = connect_h1();
+    syswrite $s, "GET /c-stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+               . "GET /perl-stream HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    my $resp = '';
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 5;
+        until ($resp =~ /\r\n0\r\n\r\n.*\r\n0\r\n\r\n/s) {
+            my $n = sysread $s, my $buf, 65536;
+            last if !defined $n || $n == 0;
+            $resp .= $buf;
+        }
+        alarm 0;
+    };
+    close $s;
+    my @parts = split /\r\n\r\n/, $resp;
+    like($parts[0] || '', qr{^Transfer-Encoding: chunked}mi,
+         'HTTP/1.1 keep-alive: the C seam\'s body is chunked');
+    like($parts[0] || '', qr{^Connection: keep-alive}mi,
+         '...and the connection is kept');
+    my $decoded = '';
+    my $raw = $parts[1] || '';
+    while ($raw =~ s/\A([0-9a-f]+)\r\n//i) {
+        my $len = hex $1;
+        last if $len == 0;
+        $decoded .= substr($raw, 0, $len);
+        substr($raw, 0, $len + 2) = '';
+    }
+    is($decoded, 'chunk1;chunk2;chunk3;', '...and decodes to the same body');
+    like($resp, qr{\r\n0\r\n\r\nHTTP/1\.1 200 }s,
+         '...and the pipelined second request was answered on the same socket');
+}
+
+like(body_h1('/perl-stream-sync'), qr/has not deferred/,
+     'a synchronous handler is refused rather than corrupting its response');
+
+my %st;
+sub state_now {
+    my $b = body_h1('/state') || '';
+    %st = $b =~ /(\w+)=(-?\d+)/g;
+    return \%st;
+}
+
+state_now();
+is($st{open},   0, 'no handle is left open after a clean close');
+is($st{aborts}, 0, 'a clean close does not report an abort');
+
+# ---- a 101 tunnel on HTTP/1.1: the seam carries an upgrade both ways -----
+#
+# What a WebSocket over TLS needs and conn_detach cannot give it: a handle
+# opened with a 101 from a SYNCHRONOUS handler, no Connection: close on it,
+# the handler's return value dropped as the sentinel it is, and the bytes the
+# peer sends afterwards reaching the read half instead of the request parser.
+
+# Read until the pattern matches, or EOF, or the timeout; undef pattern reads
+# to EOF.
+sub read_until {
+    my ($s, $re, $timeout) = @_;
+    require IO::Select;
+    my $sel = IO::Select->new($s);
+    my $got = '';
+    my $deadline = Time::HiRes::time() + $timeout;
+    while (!defined $re || $got !~ $re) {
+        my $left = $deadline - Time::HiRes::time();
+        last if $left <= 0 || !$sel->can_read($left);
+        my $n = sysread($s, my $b, 4096);
+        last unless $n;
+        $got .= $b;
+    }
+    return $got;
+}
+
+for my $case (['/tunnel', 'hello;', 'a synchronous handler'],
+              ['/tunnel-deferred', 'deferred;', 'a deferred response']) {
+    my ($path, $first, $how) = @$case;
+    my $t = connect_h1();
+    ok($t, "connected for the tunnel from $how");
+    # "early;" rides in with the request. RFC 6455 forbids a client doing
+    # that before the 101, but the bytes are the handle's either way and
+    # must reach it rather than be parsed as a request that never comes.
+    syswrite $t, "GET $path HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+               . "Upgrade: echo\r\nConnection: Upgrade\r\n\r\nearly;";
+    my $got = read_until($t, qr/\Q$first\E/, 5);
+    my ($head, $body) = split /\r\n\r\n/, $got, 2;
+    like($head || '', qr{^HTTP/1\.1 101 }, "a 101 went out from $how");
+    like($head || '', qr/^Upgrade: echo\r?$/mi, 'with the headers it was given');
+    unlike($head || '', qr/Connection: close/i,
+           'and without the Connection: close a body stream gets');
+    is($body, $first, 'the first write followed the headers raw, unframed');
+    syswrite $t, 'ping-from-client';
+    Time::HiRes::sleep(0.2);
+    is(body_h1('/tunnel-rx'), 'early;ping-from-client',
+       'bytes sent with the request and bytes sent afterwards both reached '
+     . 'the read half, in order');
+    is(body_h1('/tunnel-close'), 'close=0', 'stream_close on the tunnel handle');
+    is(read_until($t, undef, 3), '',
+       'closing the handle closed the connection, with nothing after the body');
+    close $t;
+    state_now();
+    is($st{open}, 0, 'no handle is left open after the tunnel closed');
+}
+
+# ---- abort on HTTP/1.1: a reset, because a clean close cannot say it ------
+#
+# The body is EOF-delimited, so the graceful close IS the success signal and
+# there is nothing else in the protocol left to say. A TCP reset is the only
+# thing a client can tell apart from it, which is why stream_abort sends one.
+{
+    my $s = connect_h1();
+    SKIP: {
+        skip 'no connection', 2 unless $s;
+        syswrite $s, "GET /c-stream-abort HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   . "Connection: close\r\n\r\n";
+        my ($resp, $reset) = ('', 0);
+        while (1) {
+            my $n = sysread $s, my $buf, 4096;
+            if (!defined $n) {
+                $reset = 1 if $!{ECONNRESET};
+                last;
+            }
+            last if $n == 0;
+            $resp .= $buf;
+        }
+        close $s;
+        ok($reset, 'HTTP/1.1: an aborted body ends in a reset, not a clean EOF')
+            or diag("ended cleanly with " . length($resp) . " bytes");
+
+        state_now();
+        is($st{open}, 0, '...and the handle is released, as close releases it');
+    }
+}
+
+# ---- backpressure: the producer is stopped and resumed --------------------
+#
+# The pause is reached when the server is holding more than
+# HM_ABI_STREAM_HIWAT (256KiB) that the kernel would not take, so the body has
+# to outrun every buffer between the two processes - and not reading is not
+# enough on its own. Linux autotunes a loopback send buffer up to
+# tcp_wmem[2], 4MiB by default, which swallows this 2MiB body whole: every
+# write succeeds, the producer runs straight through and `fulls` reads 0
+# forever (CPAN Testers, Hyperman 0.44, perl 5.32.1 on Debian). macOS caps
+# sendspace at 128KiB and does not autotune, which is why the same test always
+# paused here.
+#
+# Guessing a body size big enough for any tuning is the wrong end of it: the
+# client instead shrinks its OWN receive buffer before connecting, which caps
+# the window the server's send buffer can autotune against and puts the pause
+# a few tens of KiB into the body on every platform.
+{
+    my ($s, $rcvbuf) = connect_h1_window(8192);
+    SKIP: {
+        skip 'no connection', 3 unless $s;
+        syswrite $s, "GET /c-stream-big HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   . "Connection: close\r\n\r\n";
+        # Do not read yet - a client that drains as fast as the server writes
+        # never fills anything. Waiting for the server to say it is full,
+        # rather than sleeping for a guessed interval, is what makes this hold
+        # on a loaded smoker too.
+        for (1 .. 250) {
+            state_now();
+            last if $st{fulls} > 0;
+            Time::HiRes::sleep(0.02);
+        }
+        # Nothing was refused. On a kernel that ignored SO_RCVBUF the body can
+        # still fit in the buffers, and there is then no backpressure here to
+        # observe - report that, rather than failing the server for it.
+        if ($st{fulls} == 0 && $rcvbuf > 2048 * 4096) {
+            close $s;
+            skip "the whole body fits in the socket buffers "
+               . "(SO_RCVBUF=$rcvbuf)", 3;
+        }
+
+        cmp_ok($st{fulls}, '>', 0,
+               'stream_write reported the connection full at least once');
+
+        my $resp = '';
+        while (1) {
+            my $n = sysread $s, my $buf, 8192;
+            last if !defined $n || $n == 0;
+            $resp .= $buf;
+        }
+        close $s;
+        my (undef, $b) = split /\r\n\r\n/, $resp, 2;
+        is(length($b || ''), 2048 * 4096,
+           'the whole body arrived across the pause and resume');
+
+        state_now();
+        cmp_ok($st{drains}, '>', 0,
+               'and stream_on_drain fired to restart the producer');
+    }
+}
+
+# ---- abort on HTTP/1.1: the client hangs up mid-body ----------------------
+
+{
+    my $s = connect_h1();
+    SKIP: {
+        skip 'no connection', 3 unless $s;
+        syswrite $s, "GET /c-stream-hold HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   . "Connection: close\r\n\r\n";
+        my $got = '';
+        for (1 .. 200) {
+            my $n = sysread $s, my $buf, 4096;
+            last if !defined $n || $n == 0;
+            $got .= $buf;
+            last if $got =~ /hold;/;
+        }
+        like($got, qr/hold;/, 'the held stream sent its first chunk');
+        close $s;                      # the peer goes away mid-body
+
+        my $aborts = $st{aborts};
+        for (1 .. 100) {
+            state_now();
+            last if $st{aborts} > $aborts;
+            Time::HiRes::sleep(0.02);
+        }
+        is($st{aborts}, $aborts + 1,
+           'stream_on_abort fired when the connection died under the stream');
+        is($st{open}, 1,
+           'the handle itself survives the abort - only stream_close frees it');
+
+        is(body_h1('/late'), 'write=-2 close=-2',
+           'a write to a dead stream is an error return, and close still '
+         . 'releases the handle');
+    }
+}
+
+# ---- HTTP/2: the same application code, a multiplexed transport -----------
+
+SKIP: {
+    skip 'nghttp2 support not built', 15 unless $h2;
+
+    my $curl = `which curl 2>/dev/null`;
+    chomp $curl;
+    SKIP: {
+        skip 'no HTTP/2-capable curl', 3
+            unless $curl && `curl --version 2>/dev/null` =~ /\bHTTP2\b/;
+        my $out = `$curl -s --http2-prior-knowledge http://127.0.0.1:$port/c-stream 2>/dev/null`;
+        is($out, 'chunk1;chunk2;chunk3;',
+           'HTTP/2: the same seam, the same body, no branch in the app');
+        my $big = `$curl -s --http2-prior-knowledge http://127.0.0.1:$port/c-big 2>/dev/null`;
+        is(length $big, 100_003,
+           'HTTP/2: a body of several frames closed at once arrives whole');
+        is(substr($big, -4), 'xend', '...to its last byte');
+    }
+
+    # An h2 peer can reset ONE stream out of many, which HTTP/1.1 has no
+    # analogue for and is the reason stream_on_abort exists. Nothing on this
+    # machine sends a RST_STREAM on demand, so the frames are written by
+    # hand: HPACK literals without indexing need no dynamic table, and the
+    # response only has to be recognised as DATA, not decoded.
+    my $frame = sub {
+        my ($type, $flags, $sid, $pay) = @_;
+        my $l = length $pay;
+        return pack('CCCCCN', ($l >> 16) & 0xff, ($l >> 8) & 0xff, $l & 0xff,
+                    $type, $flags, $sid) . $pay;
+    };
+    my $lit = sub {
+        my ($n, $v) = @_;
+        return "\x00" . chr(length $n) . $n . chr(length $v) . $v;
+    };
+    my $read_frame = sub {
+        my ($s) = @_;
+        my $hdr = '';
+        while (length($hdr) < 9) {
+            my $n = sysread($s, my $b, 9 - length $hdr);
+            return unless $n;
+            $hdr .= $b;
+        }
+        my ($a, $b2, $c, $type, $flags, $sid) = unpack('CCCCCN', $hdr);
+        my $len = ($a << 16) | ($b2 << 8) | $c;
+        my $pay = '';
+        while (length($pay) < $len) {
+            my $n = sysread($s, my $x, $len - length $pay);
+            return unless $n;
+            $pay .= $x;
+        }
+        return ($type, $flags, $sid & 0x7fffffff, $pay);
+    };
+
+    my $s = connect_h1();
+    SKIP: {
+        skip 'no connection', 2 unless $s;
+        state_now();
+        my $aborts = $st{aborts};
+
+        syswrite $s, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        syswrite $s, $frame->(0x4, 0, 0, '');            # empty SETTINGS
+        my $hb = $lit->(':method', 'GET') . $lit->(':scheme', 'http')
+               . $lit->(':path', '/c-stream-hold')
+               . $lit->(':authority', "127.0.0.1:$port");
+        syswrite $s, $frame->(0x1, 0x5, 1, $hb);         # END_STREAM|END_HEADERS
+
+        my $data = '';
+        my $ok = eval {
+            local $SIG{ALRM} = sub { die "timeout\n" };
+            alarm 10;
+            while (1) {
+                my ($type, undef, $sid, $pay) = $read_frame->($s);
+                last unless defined $type;
+                if ($type == 0x4 && $pay eq '') {        # SETTINGS: ack it
+                    syswrite $s, $frame->(0x4, 0x1, 0, '');
+                }
+                if ($type == 0x0 && $sid == 1) { $data .= $pay; last if length $data }
+            }
+            alarm 0;
+            1;
+        };
+        alarm 0;
+
+        is($data, 'hold;',
+           'HTTP/2: the held stream sent its chunk as a DATA frame')
+            or diag($ok ? "read stopped early" : "raw h2 client: $@");
+
+        # RST_STREAM(CANCEL) on stream 1 only - the connection stays up.
+        syswrite $s, $frame->(0x3, 0, 1, pack('N', 8));
+
+        for (1 .. 100) {
+            state_now();
+            last if $st{aborts} > $aborts;
+            Time::HiRes::sleep(0.02);
+        }
+        is($st{aborts}, $aborts + 1,
+           'stream_on_abort fired on an h2 RST_STREAM, with the connection '
+         . 'still open');
+        close $s;
+
+        is(body_h1('/late'), 'write=-2 close=-2',
+           'HTTP/2: a write to the reset stream is an error return');
+    }
+
+    # ---- the abort, the other way round --------------------------------
+    #
+    # Above, the peer reset the stream and the server heard it. Here the
+    # SERVER aborts, and the peer has to hear that - which on a multiplexed
+    # transport it cannot infer, because the connection is still carrying
+    # other streams and never closes. RST_STREAM is the whole point of the
+    # entry: it says "this response is not to be trusted" about one stream
+    # and leaves the rest alone.
+    my $s2 = connect_h1();
+    SKIP: {
+        skip 'no connection', 2 unless $s2;
+        syswrite $s2, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        syswrite $s2, $frame->(0x4, 0, 0, '');
+        my $hb = $lit->(':method', 'GET') . $lit->(':scheme', 'http')
+               . $lit->(':path', '/c-stream-abort')
+               . $lit->(':authority', "127.0.0.1:$port");
+        syswrite $s2, $frame->(0x1, 0x5, 1, $hb);
+
+        my ($data, $rst, $end) = ('', undef, 0);
+        eval {
+            local $SIG{ALRM} = sub { die "timeout\n" };
+            alarm 10;
+            while (1) {
+                my ($type, $flags, $sid, $pay) = $read_frame->($s2);
+                last unless defined $type;
+                if ($type == 0x4 && $pay eq '') {
+                    syswrite $s2, $frame->(0x4, 0x1, 0, '');
+                }
+                if ($type == 0x0 && $sid == 1) {
+                    $data .= $pay;
+                    $end = 1 if $flags & 0x1;      # END_STREAM: a clean end
+                }
+                if ($type == 0x3 && $sid == 1) {   # RST_STREAM
+                    $rst = unpack 'N', $pay;
+                    last;
+                }
+            }
+            alarm 0;
+            1;
+        };
+        alarm 0;
+        close $s2;
+
+        ok(defined $rst,
+           'HTTP/2: an aborted stream is reset, so the client knows the body '
+         . 'is incomplete')
+            or diag("no RST_STREAM; got " . length($data) . " body bytes"
+                  . ($end ? " and a clean END_STREAM" : ""));
+        ok(!$end, '...and never sees the END_STREAM that would call it whole');
+    }
+
+    # ---- backpressure, where the limit is the peer's window -----------------
+    #
+    # On HTTP/1.1 a slow reader shows up as unwritten bytes on the connection.
+    # On HTTP/2 it shows up as a flow-control window that has not been
+    # reopened, and what cannot be framed waits in the stream's own buffer.
+    # Counting only the connection, a write was never answered "full" here:
+    # the producer ran to the end and the whole body was held.
+    #
+    # The client below opens a stream with the default window (65,535 bytes)
+    # and grants no more. The producer owes 8 MB, so it has to be stopped by
+    # the window and nothing else, whatever this machine's socket buffers
+    # are.
+    my $s3 = connect_h1();
+    SKIP: {
+        skip 'no connection', 4 unless $s3;
+        state_now();
+        my ($fulls, $drains, $writes) = @st{qw(fulls drains writes)};
+
+        syswrite $s3, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        syswrite $s3, $frame->(0x4, 0, 0, '');
+        my $hb = $lit->(':method', 'GET') . $lit->(':scheme', 'http')
+               . $lit->(':path', '/c-stream-big')
+               . $lit->(':authority', "127.0.0.1:$port");
+        syswrite $s3, $frame->(0x1, 0x5, 1, $hb);
+
+        for (1 .. 250) {
+            state_now();
+            last if $st{fulls} > $fulls;
+            Time::HiRes::sleep(0.02);
+        }
+        cmp_ok($st{fulls}, '>', $fulls,
+               'HTTP/2: a producer facing a closed window is told to stop');
+        Time::HiRes::sleep(0.1);
+        state_now();
+        my $made = ($st{writes} - $writes) * 4096;
+        cmp_ok($made, '<', 1024 * 1024,
+               "...having produced $made bytes of 8388608, not all of them");
+
+        # now let it go: a window on the connection and on the stream
+        my $open = pack('N', 0x7fffffff - 65535);
+        syswrite $s3, $frame->(0x8, 0, 0, $open) . $frame->(0x8, 0, 1, $open);
+
+        my ($got, $end) = (0, 0);
+        my $ok = eval {
+            local $SIG{ALRM} = sub { die "timeout\n" };
+            alarm 30;
+            while (1) {
+                my ($type, $flags, $sid, $pay) = $read_frame->($s3);
+                last unless defined $type;
+                if ($type == 0x4 && !($flags & 0x1)) {
+                    syswrite $s3, $frame->(0x4, 0x1, 0, '');
+                }
+                if ($type == 0x0 && $sid == 1) {
+                    $got += length $pay;
+                    if ($flags & 0x1) { $end = 1; last }
+                }
+            }
+            alarm 0;
+            1;
+        };
+        alarm 0;
+        close $s3;
+        is($got, 2048 * 4096,
+           '...and resumes when the window opens, to the last byte')
+            or diag($ok ? ($end ? 'ended early' : 'no END_STREAM')
+                        : "raw h2 client: $@");
+        state_now();
+        cmp_ok($st{drains}, '>', $drains,
+               '...restarted by stream_on_drain, more than once if need be');
+    }
+
+    # ---- a handler that waits for its own body --------------------------------
+    #
+    # The application used to be called from inside nghttp2's receive call,
+    # where the session may not send and the connection is not read. A handler
+    # that wrote and then waited was waiting on output that could not leave:
+    # it sat out its whole wait, and the body went only after it gave up.
+    my $s4 = connect_h1();
+    SKIP: {
+        skip 'no connection', 3 unless $s4;
+        # The window is granted the way a real client grants it: only as
+        # the data arrives, a frame's worth at a time. So the server has to
+        # READ this connection while the handler is waiting, or it never
+        # learns it may send more.
+        syswrite $s4, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        syswrite $s4, $frame->(0x4, 0, 0, '');
+        my $hb = $lit->(':method', 'GET') . $lit->(':scheme', 'http')
+               . $lit->(':path', '/c-sync-wait')
+               . $lit->(':authority', "127.0.0.1:$port");
+        syswrite $s4, $frame->(0x1, 0x5, 1, $hb);
+
+        my ($got, $end) = (0, 0);
+        my $t0 = Time::HiRes::time();
+        eval {
+            local $SIG{ALRM} = sub { die "timeout\n" };
+            alarm 30;
+            while (1) {
+                my ($type, $flags, $sid, $pay) = $read_frame->($s4);
+                last unless defined $type;
+                if ($type == 0x4 && !($flags & 0x1)) {
+                    syswrite $s4, $frame->(0x4, 0x1, 0, '');
+                }
+                if ($type == 0x0 && $sid == 1) {
+                    $got += length $pay;
+                    if ($flags & 0x1) { $end = 1; last }
+                    my $inc = pack('N', length $pay);
+                    syswrite $s4, $frame->(0x8, 0, 0, $inc)
+                                . $frame->(0x8, 0, 1, $inc) if length $pay;
+                }
+            }
+            alarm 0;
+            1;
+        };
+        alarm 0;
+        my $took = Time::HiRes::time() - $t0;
+        close $s4;
+        is($got, 512 * 4096, 'HTTP/2: a handler that waits still sends its body');
+        my $r = '';
+        for (1 .. 100) {
+            $r = body_h1('/sync-result') || '';
+            last if $r eq 'done' || $r eq 'stuck';
+            Time::HiRes::sleep(0.05);
+        }
+        is($r, 'done',
+           '...and the body finished WHILE it waited, not after it gave up');
+        cmp_ok($took, '<', 2.5,
+               sprintf('...in %.2fs, not the three seconds of a wait nothing '
+                     . 'could end', $took));
+    }
+
+    # ---- the stream is reset while its handler waits ---------------------------
+    # Reading the connection under a waiting handler means the peer can end
+    # the stream from there: the handler returns to a stream that is gone,
+    # and has to find that out rather than answer it.
+    my $s5 = connect_h1();
+    SKIP: {
+        skip 'no connection', 3 unless $s5;
+        state_now();
+        my $aborts = $st{aborts};
+        syswrite $s5, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        syswrite $s5, $frame->(0x4, 0, 0, '');
+        my $hb = $lit->(':method', 'GET') . $lit->(':scheme', 'http')
+               . $lit->(':path', '/c-sync-wait')
+               . $lit->(':authority', "127.0.0.1:$port");
+        syswrite $s5, $frame->(0x1, 0x5, 1, $hb);
+        eval {      # the first DATA: the handler is producing, and now waits
+            local $SIG{ALRM} = sub { die "timeout\n" };
+            alarm 10;
+            while (1) {
+                my ($type, $flags) = $read_frame->($s5);
+                last unless defined $type;
+                syswrite $s5, $frame->(0x4, 0x1, 0, '')
+                    if $type == 0x4 && !($flags & 0x1);
+                last if $type == 0x0;
+            }
+            alarm 0;
+        };
+        alarm 0;
+        syswrite $s5, $frame->(0x3, 0, 1, pack('N', 8));   # RST_STREAM CANCEL
+        for (1 .. 150) {
+            state_now();
+            last if $st{aborts} > $aborts && !$st{open};
+            Time::HiRes::sleep(0.02);
+        }
+        is($st{aborts}, $aborts + 1,
+           'HTTP/2: a stream reset under a waiting handler is an abort');
+        close $s5;
+        my $r = '';
+        for (1 .. 150) {
+            $r = body_h1('/sync-result') || '';
+            last if $r eq 'done' || $r eq 'stuck';
+            Time::HiRes::sleep(0.05);
+        }
+        ok($r eq 'done' || $r eq 'stuck', 'the handler came back from its wait');
+        is(body_h1('/ping-after-reset'), 'ok:/ping-after-reset',
+           '...and the worker is still serving');
+    }
+}
+
+kill 'TERM', $pid;
+server_reap($pid);
+done_testing();
