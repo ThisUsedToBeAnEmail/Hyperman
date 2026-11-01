@@ -1,0 +1,10 @@
+# The same plaintext "Hello, World!" as bench/app.psgi, written to Feersum's
+# native (non-PSGI) interface: no $env hash, no PSGI response arrayref, just
+# send_response. This is Feersum at its fastest and it is NOT a like-for-like
+# row against a PSGI server - feersum-bench.sh labels it as such. It is here
+# to bound how much of the distance is PSGI and how much is the server.
+my $body = "Hello, World!";
+sub {
+    my $req = shift;
+    $req->send_response(200, [ 'Content-Type' => 'text/plain' ], \$body);
+};
