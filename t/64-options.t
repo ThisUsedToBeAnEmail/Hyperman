@@ -105,16 +105,18 @@ SKIP: {
         refuses(qr/TLS: could not initialise/, 'proxy_protocol beside http3 warns and goes on', http3 => 1, proxy_protocol => 1, tls_cert => "$dir/bad.pem", tls_key => "$dir/bad.pem", port => 0);
         ok(scalar(grep { /proxy_protocol applies to the TCP side/ } @warned), 'with the warning');
     }
+    # The low port is on an address no box has (TEST-NET-1), so a bind would
+    # fail everywhere, root or not: the refusal has to come before it.
     SKIP: {
         skip 'no root entry here', 3 unless getpwuid(0);
-        refuses(qr/user => with reuseport => 1 cannot rebind port 80/, 'a numeric user resolves through getpwuid', user => '0', reuseport => 1, port => 80);
-        refuses(qr/user => with reuseport => 1 cannot rebind port 80/, 'and a numeric group is taken as it is', user => '0', group => '0', reuseport => 1, port => 80);
+        refuses(qr/user => with reuseport => 1 cannot rebind port 80/, 'a numeric user resolves through getpwuid', user => '0', reuseport => 1, host => '192.0.2.1', port => 80);
+        refuses(qr/user => with reuseport => 1 cannot rebind port 80/, 'and a numeric group is taken as it is', user => '0', group => '0', reuseport => 1, host => '192.0.2.1', port => 80);
         refuses(qr/group 'no-such-group-\d+': no such group/, 'a group that does not exist', user => '0', group => "no-such-group-$$", port => 0);
     }
     refuses(qr/user \d+ has no passwd entry; name a group/, 'a uid with no entry and no group', user => '4000000000', port => 0);
     SKIP: {
         skip 'no nobody user here', 1 unless getpwnam('nobody');
-        refuses(qr/user => with reuseport => 1 cannot rebind port 80/, 'a dropped user with reuseport on a low port', user => 'nobody', reuseport => 1, port => 80);
+        refuses(qr/user => with reuseport => 1 cannot rebind port 80/, 'a dropped user with reuseport on a low port', user => 'nobody', reuseport => 1, host => '192.0.2.1', port => 80);
         refuses(qr/user '.*' is not known|unknown user|no such user/i, 'a user that does not exist', user => 'no-such-user-here-' . $$, port => 0);
     }
     SKIP: {

@@ -8451,6 +8451,26 @@ static void hm_run_server(pTHX_ hm_worker_cfg *cfg) {
                   cfg->log_path, strerror(errno));
     }
 
+    /* Under reuseport the workers rebind their ports themselves, which
+     * needs the privilege for a port below 1024 that a dropped user no
+     * longer has; that pairing is refused rather than half-honoured, and
+     * refused here, before any bind, so it is the error a caller sees even
+     * where this process could not bind the low port either. */
+    if (cfg->reuseport && cfg->drop_uid_set) {
+        int i;
+        /*
+         # uncoverable branch false
+         # uncoverable condition right count:1 class:ignore_covered_err */
+        for (i = 0; i < cfg->nlspecs; i++)
+            /*
+             # uncoverable branch false
+             # uncoverable condition right count:1 class:ignore_covered_err */
+            if (cfg->lspecs[i].port < 1024)
+                croak("Hyperman->run: user => with reuseport => 1 cannot rebind "
+                      "port %d as the dropped user; drop reuseport or use a "
+                      "port above 1023", cfg->lspecs[i].port);
+    }
+
     {
         int i;
         for (i = 0; i < cfg->nlspecs; i++) {
@@ -8504,23 +8524,7 @@ static void hm_run_server(pTHX_ hm_worker_cfg *cfg) {
 
     /* Everything that needed root is held: the ports, the logs, the arena.
      * Record who we are, then stop being root, before the first fork so
-     * every worker is born as the configured user. Under reuseport the
-     * workers rebind their ports themselves, which needs the privilege for a
-     * port below 1024; that pairing is refused rather than half-honoured. */
-    if (cfg->reuseport && cfg->drop_uid_set) {
-        int i;
-        /*
-         # uncoverable branch false
-         # uncoverable condition right count:1 class:ignore_covered_err */
-        for (i = 0; i < cfg->nlspecs; i++)
-            /*
-             # uncoverable branch false
-             # uncoverable condition right count:1 class:ignore_covered_err */
-            if (cfg->lspecs[i].port < 1024)
-                croak("Hyperman->run: user => with reuseport => 1 cannot rebind "
-                      "port %d as the dropped user; drop reuseport or use a "
-                      "port above 1023", cfg->lspecs[i].port);
-    }
+     * every worker is born as the configured user. */
     hm_write_pidfile(aTHX_ cfg);
     hm_drop_privileges(aTHX_ cfg);
 
